@@ -1,6 +1,6 @@
 import torch
 import math
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Any, Any
 
 
 def lloyd_max_centroids(bits: int, n_iterations: int = 100) -> torch.Tensor:
@@ -186,6 +186,14 @@ class PlanarQuantCompressor:
         self.codebook = lloyd_max_centroids(bits).to(device)
         self.n_levels = 2**bits
 
+        # Fixed rotation angles: pi/4 for all pairs gives Hadamard-like mixing
+        # This spreads energy evenly across coordinates for better quantization
+        self.angles = torch.full((self.n_pairs,), math.pi / 4, device=device)
+
+        # Fixed rotation angles: pi/4 for all pairs gives Hadamard-like mixing
+        # This spreads energy evenly across coordinates for better quantization
+        self.angles = torch.full((self.n_pairs,), math.pi / 4, device=device)
+
     def _quantize(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Scalar quantize using Lloyd-Max codebook.
@@ -197,10 +205,11 @@ class PlanarQuantCompressor:
             indices: uint8 tensor of shape (n_vectors, head_dim)
             x_hat: dequantized tensor of same shape as x
         """
-        x_flat = x.unsqueeze(-1)
-        distances = (x_flat - self.codebook).pow(2)
+        x_reshaped = x.unsqueeze(-1)  # (n_vectors, head_dim, 1)
+        codebook = self.codebook.view(1, 1, -1)  # (1, 1, n_levels)
+        distances = (x_reshaped - codebook).pow(2)
         indices = distances.argmin(dim=-1)
-        x_hat = self.codebook[indices].squeeze(-1)
+        x_hat = self.codebook.view(-1)[indices]
         return indices.to(torch.uint8), x_hat
 
     def _dequantize(self, indices: torch.Tensor) -> torch.Tensor:
@@ -213,7 +222,7 @@ class PlanarQuantCompressor:
         Returns:
             x_hat: float tensor of same shape
         """
-        return self.codebook[indices.long()].squeeze(-1)
+        return self.codebook.view(-1)[indices.long()]
 
     def _pack_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """
@@ -277,9 +286,7 @@ class PlanarQuantCompressor:
 
         return packed
 
-    def compress(
-        self, x: torch.Tensor, pack_bits: bool = True
-    ) -> Dict[str, torch.Tensor]:
+    def compress(self, x: torch.Tensor, pack_bits: bool = True) -> Dict[str, Any]:
         """
         Compress a batch of vectors using PlanarQuant.
 
@@ -291,7 +298,6 @@ class PlanarQuantCompressor:
             dict with keys:
                 - 'indices': uint8 quantization indices (bit-packed if pack_bits=True)
                 - 'norms': fp16 per-vector norms
-                - 'angles': fp16 Givens rotation angles
                 - 'packed': bool indicating if indices are bit-packed
         """
         original_shape = x.shape
@@ -304,9 +310,8 @@ class PlanarQuantCompressor:
         # Normalize vectors
         x_norm = x / norms
 
-        # Compute and apply Givens rotations
-        angles = compute_givens_angles(x_norm)
-        x_rotated = apply_givens_rotation(x_norm, angles)
+        # Apply fixed Givens rotations (shared angles across all vectors)
+        x_rotated = apply_givens_rotation(x_norm, self.angles)
 
         # Quantize rotated vectors
         x_flat = x_rotated.reshape(-1, self.head_dim)
@@ -320,7 +325,6 @@ class PlanarQuantCompressor:
         return {
             "indices": indices,
             "norms": norms.squeeze(-1).half(),
-            "angles": angles.half(),
             "packed": pack_bits and self.bits in (3, 4),
         }
 
@@ -336,7 +340,6 @@ class PlanarQuantCompressor:
         """
         indices = compressed["indices"]
         norms = compressed["norms"].float()
-        angles = compressed["angles"].float()
 
         # Unpack indices if bit-packed
         if compressed.get("packed", False):
@@ -346,9 +349,9 @@ class PlanarQuantCompressor:
         indices_flat = indices.reshape(-1, self.head_dim)
         x_rotated = self._dequantize(indices_flat)
 
-        # Inverse Givens rotation
+        # Inverse Givens rotation (using same fixed angles)
         x_rotated = x_rotated.reshape(*norms.shape, self.head_dim)
-        x_norm = inverse_givens_rotation(x_rotated, angles)
+        x_norm = inverse_givens_rotation(x_rotated, self.angles)
 
         # Restore scale
         x_hat = x_norm * norms.unsqueeze(-1)
@@ -377,8 +380,8 @@ class PlanarQuantCompressor:
             indices_bytes = n_vectors * self.head_dim
 
         norms_bytes = n_vectors * 2
-        angles_bytes = n_vectors * self.n_pairs * 2
-        return indices_bytes + norms_bytes + angles_bytes
+        # No angles stored (fixed rotation)
+        return indices_bytes + norms_bytes
 
     def compression_ratio(self, n_vectors: int) -> float:
         """
@@ -534,14 +537,15 @@ class IsoQuantCompressor:
         return x_hat.half()
 
     def _quantize(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_flat = x.unsqueeze(-1)
-        distances = (x_flat - self.codebook).pow(2)
+        x_reshaped = x.unsqueeze(-1)
+        codebook = self.codebook.view(1, 1, -1)
+        distances = (x_reshaped - codebook).pow(2)
         indices = distances.argmin(dim=-1)
-        x_hat = self.codebook[indices].squeeze(-1)
+        x_hat = self.codebook.view(-1)[indices]
         return indices.to(torch.uint8), x_hat
 
     def _dequantize(self, indices: torch.Tensor) -> torch.Tensor:
-        return self.codebook[indices.long()].squeeze(-1)
+        return self.codebook.view(-1)[indices.long()]
 
     def memory_usage_bytes(self, n_vectors: int) -> int:
         indices_bytes = n_vectors * self.head_dim
