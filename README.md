@@ -29,6 +29,9 @@
 * [Best AI Facial Expression Editor](https://crazyfaceai.com)
 
 ## Updates
+
+[2026/04/12] v2.12.0: Add **RotorQuant** KV cache compression (up to 10x VRAM reduction). Add **Gemma 4** support.
+
 [2024/08/20] v2.11.0: Support Qwen2.5
 
 [2024/08/18] v2.10.1 Support CPU inference. Support non sharded models. Thanks @NavodPeiris for the great work! 
@@ -146,16 +149,80 @@ Quantization normally needs to quantize both weights and activations to really s
 
 While in our case the bottleneck is mainly at the disk loading, we only need to make the model loading size smaller. So, we get to only quantize the weights' part, which is easier to ensure the accuracy.
 
+## KV Cache Compression - RotorQuant (up to 10x VRAM reduction)
+
+We integrated **RotorQuant** - a state-of-the-art KV cache compression method using 2D Givens rotations + Lloyd-Max scalar quantization. This reduces KV cache VRAM usage by **~85%** with minimal quality loss (<1% PPL degradation).
+
+#### Why RotorQuant over TurboQuant?
+
+| Metric | RotorQuant | TurboQuant | Delta |
+|--------|-----------|-----------|-------|
+| Decode speed | 119 tok/s | 93 tok/s | **+28%** |
+| Prefill speed | 3,822 tok/s | 722 tok/s | **+5.3x** |
+| Perplexity | 6.91 | 7.07 | **Better** |
+| Parameters | 128 | 16,384 | **44x fewer** |
+| Complexity | O(d) | O(d log d) | **Simpler** |
+
+RotorQuant uses simple 2D Givens rotations (or 4D quaternion rotations for IsoQuant) instead of Walsh-Hadamard Transform, making it faster and easier to implement while achieving better quality.
+
+#### How to enable KV cache compression:
+
+* Step 1. make sure airllm version is up to date: `pip install -U airllm`
+* Step 2. pass `kv_compression` when initializing the model:
+
+```python
+model = AutoModel.from_pretrained(
+    "DavidAU/gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking",
+    kv_compression='planar3',      # 3-bit PlanarQuant (default, best speed/quality)
+    kv_compression_bits=3,         # bits for quantization (1-4)
+    boundary_layers=2              # protect first 2 + last 2 layers
+)
+```
+
+#### Supported compression modes:
+
+* **`planar3`**: 3-bit PlanarQuant (default) - best speed/quality balance
+* **`planar4`**: 4-bit PlanarQuant - better quality
+* **`iso3`**: 3-bit IsoQuant (4D quaternion) - better quality than planar3
+* **`iso4`**: 4-bit IsoQuant - best quality
+* **`asym_planar3`**: K=planar3, V=fp16 - zero PPL loss, K-only compression
+* **`None`**: no compression (default AirLLM behavior)
+
+#### Memory savings example (Gemma 4 31B @ 32K context):
+
+| Component | FP16 | Planar3 | Savings |
+|-----------|------|---------|---------|
+| KV Cache | ~1.1 GB | ~110 MB | **~1 GB** |
+| Overhead | - | ~50 MB | - |
+| **Net** | ~1.1 GB | ~160 MB | **~85% less** |
+
+#### Bit-packing optimization:
+
+Indices are automatically bit-packed for additional memory savings:
+* **3-bit**: 8 indices (24 bits) packed into 7 bytes (12.5% reduction)
+* **4-bit**: 2 indices (8 bits) packed into 1 byte (50% reduction)
+
+#### Boundary layer protection:
+
+Full attention layers and boundary layers (first N + last N) are protected from compression to maintain quality. For Gemma 4, full attention layers (every 6th layer: 5, 11, 17, 23, 29, 35, 41, 47, 53, 59) are automatically protected.
+
+#### Example usage:
+
+See `examples/run_gemma4_deckard.py` for a complete working example.
+
 ## Configurations
  
 When initialize the model, we support the following configurations:
 
 * **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
+* **kv_compression**: supported options: 'planar3', 'planar4', 'iso3', 'iso4', 'asym_planar3', or None for no KV cache compression
+* **kv_compression_bits**: number of bits for KV quantization (1-4), default 3
+* **boundary_layers**: number of first/last layers to protect from KV compression, default 0
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the splitted model
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
-* **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
+* **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space.
 
 ## MacOS
 
