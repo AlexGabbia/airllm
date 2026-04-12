@@ -215,18 +215,84 @@ class PlanarQuantCompressor:
         """
         return self.codebook[indices.long()].squeeze(-1)
 
-    def compress(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _pack_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Pack indices from uint8 to compact bit representation.
+        For 3-bit: packs 8 uint8 values into 3 uint8 values (24 bits).
+        For 4-bit: packs 2 uint8 values into 1 uint8 value.
+        """
+        if self.bits == 3:
+            n = indices.shape[-1]
+            pad = (8 - n % 8) % 8
+            if pad > 0:
+                indices = torch.nn.functional.pad(indices, (0, pad), value=0)
+
+            indices = indices.view(*indices.shape[:-1], -1, 8)
+
+            b0 = (indices[..., 0]) | ((indices[..., 1] & 0x03) << 7)
+            b1 = ((indices[..., 1] >> 2) & 0x3F) | ((indices[..., 2] & 0x0F) << 4)
+            b2 = ((indices[..., 2] >> 4) & 0x0F) | ((indices[..., 3] & 0x1F) << 3)
+            b3 = ((indices[..., 3] >> 5) & 0x07) | (indices[..., 4] << 3)
+            b4 = ((indices[..., 5]) & 0x7F) | ((indices[..., 6] & 0x01) << 7)
+            b5 = ((indices[..., 6] >> 1) & 0x3F) | ((indices[..., 7] & 0x03) << 6)
+            b6 = (indices[..., 7] >> 2) & 0x3F
+
+            packed = torch.stack([b0, b1, b2, b3, b4, b5, b6], dim=-1)
+            return packed.view(*indices.shape[:-2], -1)
+
+        elif self.bits == 4:
+            indices = indices.view(*indices.shape[:-1], -1, 2)
+            packed = (indices[..., 0]) | (indices[..., 1] << 4)
+            return packed.view(*indices.shape[:-2], -1)
+
+        return indices
+
+    def _unpack_indices(self, packed: torch.Tensor) -> torch.Tensor:
+        """
+        Unpack indices from compact bit representation back to uint8.
+        """
+        if self.bits == 3:
+            packed = packed.view(*packed.shape[:-1], -1, 7)
+
+            b0, b1, b2, b3, b4, b5, b6 = [packed[..., i] for i in range(7)]
+
+            i0 = b0 & 0x7F
+            i1 = ((b0 >> 7) & 0x03) | ((b1 & 0x0F) << 2)
+            i2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x07) << 4)
+            i3 = ((b2 >> 3) & 0x1F) | ((b3 & 0x03) << 5)
+            i4 = (b3 >> 3) & 0x1F
+            i5 = b4 & 0x7F
+            i6 = ((b4 >> 7) & 0x01) | ((b5 & 0x3F) << 1)
+            i7 = ((b5 >> 6) & 0x03) | ((b6 & 0x3F) << 2)
+
+            indices = torch.stack([i0, i1, i2, i3, i4, i5, i6, i7], dim=-1)
+            return indices.view(*packed.shape[:-2], -1)
+
+        elif self.bits == 4:
+            packed = packed.view(*packed.shape[:-1], -1, 1)
+            i0 = packed[..., 0] & 0x0F
+            i1 = (packed[..., 0] >> 4) & 0x0F
+            indices = torch.stack([i0, i1], dim=-1)
+            return indices.view(*packed.shape[:-2], -1)
+
+        return packed
+
+    def compress(
+        self, x: torch.Tensor, pack_bits: bool = True
+    ) -> Dict[str, torch.Tensor]:
         """
         Compress a batch of vectors using PlanarQuant.
 
         Args:
             x: tensor of shape (batch, seq, head_dim) or (n_vectors, head_dim)
+            pack_bits: whether to bit-pack indices (default True)
 
         Returns:
             dict with keys:
-                - 'indices': uint8 quantization indices
+                - 'indices': uint8 quantization indices (bit-packed if pack_bits=True)
                 - 'norms': fp16 per-vector norms
                 - 'angles': fp16 Givens rotation angles
+                - 'packed': bool indicating if indices are bit-packed
         """
         original_shape = x.shape
         x = x.float()
@@ -245,14 +311,20 @@ class PlanarQuantCompressor:
         # Quantize rotated vectors
         x_flat = x_rotated.reshape(-1, self.head_dim)
         indices, _ = self._quantize(x_flat)
+        indices = indices.reshape(*original_shape[:-1], self.head_dim)
+
+        # Bit-pack indices if requested
+        if pack_bits and self.bits in (3, 4):
+            indices = self._pack_indices(indices)
 
         return {
-            "indices": indices.reshape(*original_shape[:-1], self.head_dim),
+            "indices": indices,
             "norms": norms.squeeze(-1).half(),
             "angles": angles.half(),
+            "packed": pack_bits and self.bits in (3, 4),
         }
 
-    def decompress(self, compressed: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def decompress(self, compressed: Dict[str, Any]) -> torch.Tensor:
         """
         Decompress PlanarQuant representation back to fp16.
 
@@ -265,6 +337,10 @@ class PlanarQuantCompressor:
         indices = compressed["indices"]
         norms = compressed["norms"].float()
         angles = compressed["angles"].float()
+
+        # Unpack indices if bit-packed
+        if compressed.get("packed", False):
+            indices = self._unpack_indices(indices)
 
         # Dequantize
         indices_flat = indices.reshape(-1, self.head_dim)
@@ -279,17 +355,27 @@ class PlanarQuantCompressor:
 
         return x_hat.half()
 
-    def memory_usage_bytes(self, n_vectors: int) -> int:
+    def memory_usage_bytes(self, n_vectors: int, packed: bool = True) -> int:
         """
         Calculate memory usage for n_vectors compressed vectors.
 
         Args:
             n_vectors: number of vectors
+            packed: whether indices are bit-packed
 
         Returns:
             bytes: total memory in bytes
         """
-        indices_bytes = n_vectors * self.head_dim
+        if packed and self.bits == 3:
+            # 3-bit: 7 bytes per 8 indices
+            indices_bytes = n_vectors * self.head_dim * 7 // 8
+        elif packed and self.bits == 4:
+            # 4-bit: 1 byte per 2 indices
+            indices_bytes = n_vectors * self.head_dim // 2
+        else:
+            # No packing: 1 byte per index (uint8)
+            indices_bytes = n_vectors * self.head_dim
+
         norms_bytes = n_vectors * 2
         angles_bytes = n_vectors * self.n_pairs * 2
         return indices_bytes + norms_bytes + angles_bytes
