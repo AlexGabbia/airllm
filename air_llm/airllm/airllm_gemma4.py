@@ -84,14 +84,24 @@ class AirLLMGemma4(AirLLMBaseModel):
     def _is_boundary_layer(self, layer_idx):
         """
         Check if layer is a boundary layer (should not be compressed).
-        Also protects full attention layers which are more sensitive.
+        Full attention layers (every 6th) are always protected because they
+        aggregate global context and are more sensitive to compression artifacts.
         """
-        if self.boundary_layers == 0:
-            return False
-        n_layers = self.n_layers
         is_boundary = (
-            layer_idx < self.boundary_layers
-            or layer_idx >= n_layers - self.boundary_layers
+            self.boundary_layers > 0
+            and (
+                layer_idx < self.boundary_layers
+                or layer_idx >= self.n_layers - self.boundary_layers
+            )
         )
-        # Full attention layers are more sensitive to compression
+        # Full attention layers are always protected regardless of boundary_layers
         return is_boundary or self._is_full_attention_layer(layer_idx)
+
+    def get_kv_compressor(self, layer_idx):
+        """
+        Return the appropriate KV compressor for this layer.
+        Full attention layers use global_head_dim, sliding layers use head_dim.
+        """
+        if self._is_full_attention_layer(layer_idx) and self.kv_compressor_global is not None:
+            return self.kv_compressor_global
+        return self.kv_compressor

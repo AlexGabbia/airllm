@@ -158,6 +158,58 @@ def compute_givens_angles(x: torch.Tensor) -> torch.Tensor:
     return angles
 
 
+def _pack_3bit_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Pack 8 x 3-bit values (uint8) into 3 bytes (24 bits)."""
+    n = indices.shape[-1]
+    pad = (8 - n % 8) % 8
+    if pad > 0:
+        indices = torch.nn.functional.pad(indices, (0, pad), value=0)
+
+    indices = indices.view(*indices.shape[:-1], -1, 8)
+
+    b0 = (indices[..., 0] & 0x07) | ((indices[..., 1] & 0x07) << 3) | ((indices[..., 2] & 0x03) << 6)
+    b1 = ((indices[..., 2] >> 2) & 0x01) | ((indices[..., 3] & 0x07) << 1) | ((indices[..., 4] & 0x07) << 4) | ((indices[..., 5] & 0x01) << 7)
+    b2 = ((indices[..., 5] >> 1) & 0x03) | ((indices[..., 6] & 0x07) << 2) | ((indices[..., 7] & 0x07) << 5)
+
+    packed = torch.stack([b0, b1, b2], dim=-1).to(torch.uint8)
+    return packed.view(*indices.shape[:-2], -1)
+
+
+def _unpack_3bit_indices(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack 3 bytes into 8 x 3-bit values."""
+    packed = packed.view(*packed.shape[:-1], -1, 3)
+
+    b0, b1, b2 = packed[..., 0], packed[..., 1], packed[..., 2]
+
+    i0 = b0 & 0x07
+    i1 = (b0 >> 3) & 0x07
+    i2 = ((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)
+    i3 = (b1 >> 1) & 0x07
+    i4 = (b1 >> 4) & 0x07
+    i5 = ((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)
+    i6 = (b2 >> 2) & 0x07
+    i7 = (b2 >> 5) & 0x07
+
+    indices = torch.stack([i0, i1, i2, i3, i4, i5, i6, i7], dim=-1)
+    return indices.view(*packed.shape[:-2], -1)
+
+
+def _pack_4bit_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Pack 2 x 4-bit values (uint8) into 1 byte."""
+    indices = indices.view(*indices.shape[:-1], -1, 2)
+    packed = (indices[..., 0] & 0x0F) | ((indices[..., 1] & 0x0F) << 4)
+    return packed.view(*indices.shape[:-2], -1).to(torch.uint8)
+
+
+def _unpack_4bit_indices(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack 1 byte into 2 x 4-bit values."""
+    packed_flat = packed.view(*packed.shape[:-1], -1)
+    i0 = packed_flat & 0x0F
+    i1 = (packed_flat >> 4) & 0x0F
+    indices = torch.stack([i0, i1], dim=-1)
+    return indices.view(*packed.shape[:-1], -1)
+
+
 class PlanarQuantCompressor:
     """
     PlanarQuant compressor using 2D Givens rotations + Lloyd-Max scalar quantization.
@@ -165,7 +217,8 @@ class PlanarQuantCompressor:
     Implements the RotorQuant PlanarQuant method which achieves better perplexity
     than TurboQuant with 28% faster decode and 5.3x faster prefill.
 
-    Compression ratio for 3-bit: ~5x (10.3x with bit-packing)
+    Compression ratio for 3-bit with bit-packing: ~5x vs fp16
+    Compression ratio for 4-bit with bit-packing: ~1.6x vs fp16
     """
 
     def __init__(self, head_dim: int, bits: int = 3, device: str = "cuda"):
@@ -185,10 +238,6 @@ class PlanarQuantCompressor:
 
         self.codebook = lloyd_max_centroids(bits).to(device)
         self.n_levels = 2**bits
-
-        # Fixed rotation angles: pi/4 for all pairs gives Hadamard-like mixing
-        # This spreads energy evenly across coordinates for better quantization
-        self.angles = torch.full((self.n_pairs,), math.pi / 4, device=device)
 
         # Fixed rotation angles: pi/4 for all pairs gives Hadamard-like mixing
         # This spreads energy evenly across coordinates for better quantization
@@ -225,65 +274,19 @@ class PlanarQuantCompressor:
         return self.codebook.view(-1)[indices.long()]
 
     def _pack_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """
-        Pack indices from uint8 to compact bit representation.
-        For 3-bit: packs 8 uint8 values into 3 uint8 values (24 bits).
-        For 4-bit: packs 2 uint8 values into 1 uint8 value.
-        """
+        """Pack indices from uint8 to compact bit representation."""
         if self.bits == 3:
-            n = indices.shape[-1]
-            pad = (8 - n % 8) % 8
-            if pad > 0:
-                indices = torch.nn.functional.pad(indices, (0, pad), value=0)
-
-            indices = indices.view(*indices.shape[:-1], -1, 8)
-
-            b0 = (indices[..., 0]) | ((indices[..., 1] & 0x03) << 7)
-            b1 = ((indices[..., 1] >> 2) & 0x3F) | ((indices[..., 2] & 0x0F) << 4)
-            b2 = ((indices[..., 2] >> 4) & 0x0F) | ((indices[..., 3] & 0x1F) << 3)
-            b3 = ((indices[..., 3] >> 5) & 0x07) | (indices[..., 4] << 3)
-            b4 = ((indices[..., 5]) & 0x7F) | ((indices[..., 6] & 0x01) << 7)
-            b5 = ((indices[..., 6] >> 1) & 0x3F) | ((indices[..., 7] & 0x03) << 6)
-            b6 = (indices[..., 7] >> 2) & 0x3F
-
-            packed = torch.stack([b0, b1, b2, b3, b4, b5, b6], dim=-1)
-            return packed.view(*indices.shape[:-2], -1)
-
+            return _pack_3bit_indices(indices)
         elif self.bits == 4:
-            indices = indices.view(*indices.shape[:-1], -1, 2)
-            packed = (indices[..., 0]) | (indices[..., 1] << 4)
-            return packed.view(*indices.shape[:-2], -1)
-
+            return _pack_4bit_indices(indices)
         return indices
 
     def _unpack_indices(self, packed: torch.Tensor) -> torch.Tensor:
-        """
-        Unpack indices from compact bit representation back to uint8.
-        """
+        """Unpack indices from compact bit representation back to uint8."""
         if self.bits == 3:
-            packed = packed.view(*packed.shape[:-1], -1, 7)
-
-            b0, b1, b2, b3, b4, b5, b6 = [packed[..., i] for i in range(7)]
-
-            i0 = b0 & 0x7F
-            i1 = ((b0 >> 7) & 0x03) | ((b1 & 0x0F) << 2)
-            i2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x07) << 4)
-            i3 = ((b2 >> 3) & 0x1F) | ((b3 & 0x03) << 5)
-            i4 = (b3 >> 3) & 0x1F
-            i5 = b4 & 0x7F
-            i6 = ((b4 >> 7) & 0x01) | ((b5 & 0x3F) << 1)
-            i7 = ((b5 >> 6) & 0x03) | ((b6 & 0x3F) << 2)
-
-            indices = torch.stack([i0, i1, i2, i3, i4, i5, i6, i7], dim=-1)
-            return indices.view(*packed.shape[:-2], -1)
-
+            return _unpack_3bit_indices(packed)
         elif self.bits == 4:
-            packed = packed.view(*packed.shape[:-1], -1, 1)
-            i0 = packed[..., 0] & 0x0F
-            i1 = (packed[..., 0] >> 4) & 0x0F
-            indices = torch.stack([i0, i1], dim=-1)
-            return indices.view(*packed.shape[:-2], -1)
-
+            return _unpack_4bit_indices(packed)
         return packed
 
     def compress(self, x: torch.Tensor, pack_bits: bool = True) -> Dict[str, Any]:
@@ -370,8 +373,8 @@ class PlanarQuantCompressor:
             bytes: total memory in bytes
         """
         if packed and self.bits == 3:
-            # 3-bit: 7 bytes per 8 indices
-            indices_bytes = n_vectors * self.head_dim * 7 // 8
+            # 3-bit: 3 bytes per 8 indices (24 bits)
+            indices_bytes = n_vectors * self.head_dim * 3 // 8
         elif packed and self.bits == 4:
             # 4-bit: 1 byte per 2 indices
             indices_bytes = n_vectors * self.head_dim // 2
@@ -405,7 +408,8 @@ class IsoQuantCompressor:
     Implements the RotorQuant IsoQuant method which achieves the best quality
     at 4-bit (PPL 9.03 vs 9.56 for PlanarQuant).
 
-    Compression ratio for 3-bit: ~5x
+    Compression ratio for 3-bit with bit-packing: ~5x vs fp16
+    Compression ratio for 4-bit with bit-packing: ~1.6x vs fp16
     """
 
     def __init__(self, head_dim: int, bits: int = 3, device: str = "cuda"):
@@ -483,17 +487,35 @@ class IsoQuantCompressor:
 
         return x_unrotated
 
-    def compress(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _pack_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Pack indices from uint8 to compact bit representation."""
+        if self.bits == 3:
+            return _pack_3bit_indices(indices)
+        elif self.bits == 4:
+            return _pack_4bit_indices(indices)
+        return indices
+
+    def _unpack_indices(self, packed: torch.Tensor) -> torch.Tensor:
+        """Unpack indices from compact bit representation back to uint8."""
+        if self.bits == 3:
+            return _unpack_3bit_indices(packed)
+        elif self.bits == 4:
+            return _unpack_4bit_indices(packed)
+        return packed
+
+    def compress(self, x: torch.Tensor, pack_bits: bool = True) -> Dict[str, Any]:
         """
         Compress a batch of vectors using IsoQuant.
 
         Args:
             x: tensor of shape (batch, seq, head_dim) or (n_vectors, head_dim)
+            pack_bits: whether to bit-pack indices (default True)
 
         Returns:
             dict with keys:
-                - 'indices': uint8 quantization indices
+                - 'indices': uint8 quantization indices (bit-packed if pack_bits=True)
                 - 'norms': fp16 per-vector norms
+                - 'packed': bool indicating if indices are bit-packed
         """
         original_shape = x.shape
         x = x.float()
@@ -507,13 +529,18 @@ class IsoQuantCompressor:
         x_rotated, _ = self._apply_quaternion_rotation(x_flat)
 
         indices, _ = self._quantize(x_rotated)
+        indices = indices.reshape(*original_shape[:-1], self.head_dim)
+
+        if pack_bits and self.bits in (3, 4):
+            indices = self._pack_indices(indices)
 
         return {
-            "indices": indices.reshape(*original_shape[:-1], self.head_dim),
+            "indices": indices,
             "norms": norms.squeeze(-1).half(),
+            "packed": pack_bits and self.bits in (3, 4),
         }
 
-    def decompress(self, compressed: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def decompress(self, compressed: Dict[str, Any]) -> torch.Tensor:
         """
         Decompress IsoQuant representation back to fp16.
 
@@ -525,6 +552,10 @@ class IsoQuantCompressor:
         """
         indices = compressed["indices"]
         norms = compressed["norms"].float()
+
+        # Unpack indices if bit-packed
+        if compressed.get("packed", False):
+            indices = self._unpack_indices(indices)
 
         indices_flat = indices.reshape(-1, self.head_dim)
         x_rotated = self._dequantize(indices_flat)
@@ -547,8 +578,16 @@ class IsoQuantCompressor:
     def _dequantize(self, indices: torch.Tensor) -> torch.Tensor:
         return self.codebook.view(-1)[indices.long()]
 
-    def memory_usage_bytes(self, n_vectors: int) -> int:
-        indices_bytes = n_vectors * self.head_dim
+    def memory_usage_bytes(self, n_vectors: int, packed: bool = True) -> int:
+        if packed and self.bits == 3:
+            # 3-bit: 3 bytes per 8 indices (24 bits)
+            indices_bytes = n_vectors * self.head_dim * 3 // 8
+        elif packed and self.bits == 4:
+            # 4-bit: 1 byte per 2 indices
+            indices_bytes = n_vectors * self.head_dim // 2
+        else:
+            # No packing: 1 byte per index (uint8)
+            indices_bytes = n_vectors * self.head_dim
         norms_bytes = n_vectors * 2
         return indices_bytes + norms_bytes
 

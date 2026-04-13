@@ -38,6 +38,110 @@ _spec2.loader.exec_module(rotorquant_cache)
 RotorQuantKVCache = rotorquant_cache.RotorQuantKVCache
 
 
+class TestBitPacking3Bit:
+    """Test 3-bit bit-packing roundtrip correctness."""
+
+    def test_pack_unpack_roundtrip(self):
+        """Test that 3-bit pack/unpack preserves index values exactly."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128  # Must be divisible by 8
+        compressor = PlanarQuantCompressor(head_dim, 3, device)
+
+        # Create known indices (values 0-7 for 3-bit)
+        indices = torch.randint(0, 8, (64, head_dim), device=device, dtype=torch.uint8)
+
+        # Pack and unpack
+        packed = compressor._pack_indices(indices)
+        unpacked = compressor._unpack_indices(packed)
+
+        # Trim padding if any
+        assert torch.equal(indices, unpacked[:, :head_dim]), (
+            f"3-bit packing roundtrip failed: "
+            f"max diff = {(indices[:, :head_dim].long() - unpacked[:, :head_dim].long()).abs().max()}"
+        )
+
+    def test_packed_size(self):
+        """Test that 3-bit packing produces the correct output size."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = PlanarQuantCompressor(head_dim, 3, device)
+
+        indices = torch.randint(0, 8, (64, head_dim), device=device, dtype=torch.uint8)
+        packed = compressor._pack_indices(indices)
+
+        # 128 indices * 3 bits = 384 bits = 48 bytes
+        expected_packed_len = head_dim * 3 // 8
+        assert packed.shape[-1] == expected_packed_len, (
+            f"Packed size {packed.shape[-1]} != expected {expected_packed_len}"
+        )
+
+    def test_all_zeros(self):
+        """Test 3-bit packing with all-zero indices."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = PlanarQuantCompressor(head_dim, 3, device)
+
+        indices = torch.zeros(32, head_dim, device=device, dtype=torch.uint8)
+        packed = compressor._pack_indices(indices)
+        unpacked = compressor._unpack_indices(packed)
+
+        assert torch.equal(indices, unpacked[:, :head_dim])
+
+    def test_all_max_values(self):
+        """Test 3-bit packing with all max values (7)."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = PlanarQuantCompressor(head_dim, 3, device)
+
+        indices = torch.full((32, head_dim), 7, device=device, dtype=torch.uint8)
+        packed = compressor._pack_indices(indices)
+        unpacked = compressor._unpack_indices(packed)
+
+        assert torch.equal(indices, unpacked[:, :head_dim])
+
+    def test_non_divisible_head_dim(self):
+        """Test 3-bit packing with head_dim not divisible by 8 (requires padding)."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 100  # Not divisible by 8, requires 4 padding values
+        compressor = PlanarQuantCompressor(head_dim, 3, device)
+
+        indices = torch.randint(0, 8, (32, head_dim), device=device, dtype=torch.uint8)
+        packed = compressor._pack_indices(indices)
+        unpacked = compressor._unpack_indices(packed)
+
+        assert torch.equal(indices, unpacked[:, :head_dim])
+
+
+class TestBitPacking4Bit:
+    """Test 4-bit bit-packing roundtrip correctness."""
+
+    def test_pack_unpack_roundtrip(self):
+        """Test that 4-bit pack/unpack preserves index values exactly."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = PlanarQuantCompressor(head_dim, 4, device)
+
+        indices = torch.randint(0, 16, (64, head_dim), device=device, dtype=torch.uint8)
+
+        packed = compressor._pack_indices(indices)
+        unpacked = compressor._unpack_indices(packed)
+
+        assert torch.equal(indices, unpacked), "4-bit packing roundtrip failed"
+
+    def test_packed_size(self):
+        """Test that 4-bit packing produces the correct output size."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = PlanarQuantCompressor(head_dim, 4, device)
+
+        indices = torch.randint(0, 16, (64, head_dim), device=device, dtype=torch.uint8)
+        packed = compressor._pack_indices(indices)
+
+        # 128 indices * 4 bits = 512 bits = 64 bytes
+        expected_packed_len = head_dim // 2
+        assert packed.shape[-1] == expected_packed_len
+
+
 class TestPlanarQuantCompressor:
     """Test PlanarQuant compression/decompression."""
 
@@ -48,30 +152,44 @@ class TestPlanarQuantCompressor:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compressor = PlanarQuantCompressor(head_dim, bits, device)
 
-        # Create random KV cache-like data
         n_vectors = 64
         x = torch.randn(n_vectors, head_dim, device=device, dtype=torch.float16)
 
-        # Compress and decompress
         compressed = compressor.compress(x)
         x_hat = compressor.decompress(compressed)
 
-        # Check shape matches
         assert x_hat.shape == x.shape
 
-        # Check cosine similarity (3-bit ~0.39, 4-bit ~0.80 for random data)
-        # Real KV cache data is more structured and will have higher similarity
         x_flat = x.float().flatten()
         x_hat_flat = x_hat.float().flatten()
         cosine_sim = torch.nn.functional.cosine_similarity(
             x_flat.unsqueeze(0), x_hat_flat.unsqueeze(0)
         ).item()
 
-        # 4-bit should be > 0.75, 3-bit > 0.35 for random data
         min_sim = 0.75 if bits == 4 else 0.35
         assert cosine_sim > min_sim, (
             f"Cosine similarity {cosine_sim} too low for {bits}-bit"
         )
+
+    @pytest.mark.parametrize("bits", [3, 4])
+    def test_compress_with_packing_roundtrip(self, bits):
+        """Test full compress/decompress with bit-packing enabled."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = PlanarQuantCompressor(head_dim, bits, device)
+
+        n_vectors = 64
+        x = torch.randn(n_vectors, head_dim, device=device, dtype=torch.float16)
+
+        compressed = compressor.compress(x, pack_bits=True)
+        assert compressed["packed"] is True
+
+        x_hat = compressor.decompress(compressed)
+        assert x_hat.shape == x.shape
+
+        # Verify packing actually reduced size
+        uncompressed = compressor.compress(x, pack_bits=False)
+        assert compressed["indices"].numel() < uncompressed["indices"].numel()
 
     @pytest.mark.parametrize("bits", [3, 4])
     def test_compression_ratio(self, bits):
@@ -82,10 +200,6 @@ class TestPlanarQuantCompressor:
 
         n_vectors = 1000
         ratio = compressor.compression_ratio(n_vectors)
-
-        # With bit-packing: 3-bit gives ~1.06x, 4-bit gives ~1.32x on raw data
-        # But we save on norms (fp16 per vector vs fp16 per head_dim values)
-        # The real savings come from not storing angles
         assert ratio > 1.0, f"Compression ratio {ratio} should be > 1.0 for {bits}-bit"
 
     def test_output_keys(self):
@@ -104,28 +218,6 @@ class TestPlanarQuantCompressor:
         assert compressed["indices"].dtype == torch.uint8
         assert compressed["norms"].dtype == torch.float16
 
-    def test_bit_packing(self):
-        """Test that bit-packing reduces index size."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        head_dim = 128  # divisible by 8 for 3-bit packing
-
-        compressor_3bit = PlanarQuantCompressor(head_dim, 3, device)
-        n_vectors = 32
-        x = torch.randn(n_vectors, head_dim, device=device, dtype=torch.float16)
-
-        # With packing
-        compressed_packed = compressor_3bit.compress(x, pack_bits=True)
-        # Without packing
-        compressed_unpacked = compressor_3bit.compress(x, pack_bits=False)
-
-        assert compressed_packed["packed"] is True
-        assert compressed_unpacked["packed"] is False
-        # Packed should be smaller in the last dimension
-        assert (
-            compressed_packed["indices"].shape[-1]
-            < compressed_unpacked["indices"].shape[-1]
-        )
-
 
 class TestIsoQuantCompressor:
     """Test IsoQuant compression/decompression."""
@@ -143,10 +235,8 @@ class TestIsoQuantCompressor:
         compressed = compressor.compress(x)
         x_hat = compressor.decompress(compressed)
 
-        # Check shape
         assert x_hat.shape == x.shape
 
-        # Check quality (IsoQuant uses Hadamard-like rotation, ~0.80 for random data)
         x_flat = x.float().flatten()
         x_hat_flat = x_hat.float().flatten()
         cosine_sim = torch.nn.functional.cosine_similarity(
@@ -157,29 +247,63 @@ class TestIsoQuantCompressor:
             f"Cosine similarity {cosine_sim} too low for {bits}-bit"
         )
 
+    @pytest.mark.parametrize("bits", [3, 4])
+    def test_compress_with_packing_roundtrip(self, bits):
+        """Test IsoQuant compress/decompress with bit-packing."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = IsoQuantCompressor(head_dim, bits, device)
+
+        n_vectors = 64
+        x = torch.randn(n_vectors, head_dim, device=device, dtype=torch.float16)
+
+        compressed = compressor.compress(x, pack_bits=True)
+        assert compressed["packed"] is True
+
+        x_hat = compressor.decompress(compressed)
+        assert x_hat.shape == x.shape
+
+        # Verify quality with packing
+        x_flat = x.float().flatten()
+        x_hat_flat = x_hat.float().flatten()
+        cosine_sim = torch.nn.functional.cosine_similarity(
+            x_flat.unsqueeze(0), x_hat_flat.unsqueeze(0)
+        ).item()
+        assert cosine_sim > 0.75, (
+            f"Cosine similarity {cosine_sim} too low for {bits}-bit with packing"
+        )
+
+    @pytest.mark.parametrize("bits", [3, 4])
+    def test_compression_ratio(self, bits):
+        """Test IsoQuant compression ratio."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = 128
+        compressor = IsoQuantCompressor(head_dim, bits, device)
+
+        n_vectors = 1000
+        ratio = compressor.compression_ratio(n_vectors)
+        assert ratio > 1.0, f"Compression ratio {ratio} should be > 1.0 for {bits}-bit"
+
 
 class TestRotorQuantKVCache:
     """Test RotorQuant KV Cache wrapper."""
 
-    @pytest.mark.parametrize("mode", ["planar3", "planar4"])
+    @pytest.mark.parametrize("mode", ["planar3", "planar4", "iso3", "iso4"])
     def test_kv_cache_compress_decompress(self, mode):
         """Test KV cache compression and decompression."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         head_dim = 128
+        bits = int(mode[-1])
         cache = RotorQuantKVCache(mode=mode, head_dim=head_dim, device=device)
 
-        # Create KV cache tensors (batch=1, heads=4, seq=32, head_dim)
         k_cache = torch.randn(1, 4, 32, head_dim, device=device, dtype=torch.float16)
         v_cache = torch.randn(1, 4, 32, head_dim, device=device, dtype=torch.float16)
 
-        # Compress
         compressed = cache.compress(k_cache, v_cache)
         assert compressed["is_compressed"] is True
 
-        # Decompress
         k_decompressed, v_decompressed = cache.decompress(compressed)
 
-        # Check shapes match
         assert k_decompressed.shape == k_cache.shape
         assert v_decompressed.shape == v_cache.shape
 
@@ -211,7 +335,6 @@ class TestRotorQuantKVCache:
         compressed_bytes = cache.memory_usage_bytes(n_vectors)
         fp16_bytes = n_vectors * head_dim * 2 * 2  # K+V fp16
 
-        # Should use less memory than fp16
         assert compressed_bytes < fp16_bytes, (
             f"Compressed ({compressed_bytes}) should be < fp16 ({fp16_bytes})"
         )

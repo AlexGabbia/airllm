@@ -116,10 +116,7 @@ class AirLLMBaseModel(GenerationMixin):
         self.kv_compression_bits = kv_compression_bits
         self.boundary_layers = boundary_layers
         self.kv_compressor = None
-        self.kv_compression = kv_compression
-        self.kv_compression_bits = kv_compression_bits
-        self.boundary_layers = boundary_layers
-        self.kv_compressor = None
+        self.kv_compressor_global = None
 
         # Save parameters
 
@@ -207,14 +204,28 @@ class AirLLMBaseModel(GenerationMixin):
                 head_dim=head_dim,
                 device=self.running_device,
             )
-            print(
-                f"KV cache compression enabled: {kv_compression} ({kv_compression_bits}-bit), "
-                f"boundary_layers={boundary_layers}"
-            )
-            print(
-                f"KV cache compression enabled: {kv_compression} ({kv_compression_bits}-bit), "
-                f"boundary_layers={boundary_layers}"
-            )
+
+            # Handle models with mixed head dimensions (e.g., Gemma 4 global attention)
+            self.kv_compressor_global = None
+            global_head_dim = getattr(self.config, "global_head_dim", None)
+            if global_head_dim is not None and global_head_dim != head_dim:
+                self.kv_compressor_global = RotorQuantKVCache(
+                    mode=kv_compression,
+                    bits=kv_compression_bits,
+                    head_dim=global_head_dim,
+                    device=self.running_device,
+                )
+                print(
+                    f"KV cache compression enabled: {kv_compression} ({kv_compression_bits}-bit), "
+                    f"boundary_layers={boundary_layers}, "
+                    f"head_dim={head_dim}, global_head_dim={global_head_dim}"
+                )
+            else:
+                print(
+                    f"KV cache compression enabled: {kv_compression} ({kv_compression_bits}-bit), "
+                    f"boundary_layers={boundary_layers}, "
+                    f"head_dim={head_dim}"
+                )
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -249,15 +260,9 @@ class AirLLMBaseModel(GenerationMixin):
             or layer_idx >= n_layers - self.boundary_layers
         )
 
-    def _is_boundary_layer(self, layer_idx):
-        """Check if layer is a boundary layer (should not be compressed)."""
-        if self.boundary_layers == 0:
-            return False
-        n_layers = self.n_layers
-        return (
-            layer_idx < self.boundary_layers
-            or layer_idx >= n_layers - self.boundary_layers
-        )
+    def get_kv_compressor(self, layer_idx):
+        """Return the KV compressor for this layer. Override in subclasses for mixed head dimensions."""
+        return self.kv_compressor
 
     def init_model(self):
         # try way 1 better transformers...
@@ -494,7 +499,15 @@ class AirLLMBaseModel(GenerationMixin):
         return self.forward(*args, **kwargs)
 
     def get_past_key_values_cache_seq_len(self, past_key_values):
-        return past_key_values[0][0].shape[2]
+        entry = past_key_values[0]
+        if isinstance(entry, dict):
+            # Compressed or uncompressed dict format
+            if entry.get("is_compressed", False):
+                return entry["k_shape"][2]
+            else:
+                return entry["k"].shape[2]
+        # Legacy tuple format: (k_cache, v_cache)
+        return entry[0].shape[2]
 
     def get_sequence_len(self, seq):
         return seq.shape[1]
@@ -530,8 +543,9 @@ class AirLLMBaseModel(GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if cache_utils_installed:
-            # we don't support kv cache for new version yet
+        if cache_utils_installed and self.kv_compressor is None:
+            # Only disable use_cache if we don't have KV compression.
+            # With KV compression, we can handle past_key_values in compressed form.
             use_cache = False
 
         if self.profiling_mode:
@@ -559,10 +573,7 @@ class AirLLMBaseModel(GenerationMixin):
             self.max_seq_len, dtype=torch.long, device=self.running_device
         )[None, :]
 
-        kv_cache_list = [] if use_cache else None
-        if use_cache:
-            for x in self.layers:
-                kv_cache_list.append(([], []))
+        kv_cache_list = [None] * len(self.layers) if use_cache else None
         all_hidden_states = [] * len(self.layers) if output_hidden_states else None
         all_self_attns = [] * len(self.layers) if output_attentions else None
 
@@ -651,16 +662,14 @@ class AirLLMBaseModel(GenerationMixin):
 
                         if past_key_values is not None:
                             # join past kv
-                            k_cache, v_cache = past_key_values[i - 1]
-                            if self.kv_compressor is not None and isinstance(
-                                k_cache, dict
-                            ):
-                                k_cache, v_cache = self.kv_compressor.decompress(
-                                    k_cache, v_cache
-                                )
-                            len_p = self.get_past_key_values_cache_seq_len(
-                                past_key_values
-                            )
+                            entry = past_key_values[i - 1]
+                            if isinstance(entry, dict) and entry.get("is_compressed", False):
+                                compressor = self.get_kv_compressor(i - 1)
+                                k_cache, v_cache = compressor.decompress(entry)
+                            elif isinstance(entry, dict):
+                                k_cache, v_cache = entry["k"], entry["v"]
+                            else:
+                                k_cache, v_cache = entry
                             len_p = self.get_past_key_values_cache_seq_len(
                                 past_key_values
                             )
@@ -703,14 +712,16 @@ class AirLLMBaseModel(GenerationMixin):
                                     self.kv_compressor is not None
                                     and not self._is_boundary_layer(i - 1)
                                 ):
-                                    compressed = self.kv_compressor.compress(
+                                    compressor = self.get_kv_compressor(i - 1)
+                                    kv_cache_list[i] = compressor.compress(
                                         k_cache, v_cache
                                     )
-                                    kv_cache_list[i][0].append(compressed["k"])
-                                    kv_cache_list[i][1].append(compressed["v"])
                                 else:
-                                    kv_cache_list[i][0].append(k_cache)
-                                    kv_cache_list[i][1].append(v_cache)
+                                    kv_cache_list[i] = {
+                                        "k": k_cache,
+                                        "v": v_cache,
+                                        "is_compressed": False,
+                                    }
 
                         else:
                             len_seq = self.get_sequence_len(seq)
@@ -760,16 +771,16 @@ class AirLLMBaseModel(GenerationMixin):
                                     self.kv_compressor is not None
                                     and not self._is_boundary_layer(i - 1)
                                 ):
-                                    compressed = self.kv_compressor.compress(
+                                    compressor = self.get_kv_compressor(i - 1)
+                                    kv_cache_list[i] = compressor.compress(
                                         k_cache, v_cache
                                     )
-                                    kv_cache_list[i][0].append(compressed["k"])
-                                    kv_cache_list[i][1].append(compressed["v"])
                                 else:
-                                    kv_cache_list[i][0].append(k_cache)
-                                    kv_cache_list[i][1].append(v_cache)
-
-                                # print(f"k_cache sizes: {[len(x[1]) for x in kv_cache_list]}")
+                                    kv_cache_list[i] = {
+                                        "k": k_cache,
+                                        "v": v_cache,
+                                        "is_compressed": False,
+                                    }
 
                         batch[j] = new_seq
 
@@ -791,14 +802,10 @@ class AirLLMBaseModel(GenerationMixin):
 
         logits = torch.cat(batch, 0)
         if use_cache:
+            # Remove embed, norm, and lm_head entries
             kv_cache_list = kv_cache_list[1:-2]
-            for i in range(len(kv_cache_list)):
-                # print(f"{i} - {kv_cache_list[i][0].shape}")
-                kv_cache_list[i] = (
-                    torch.cat(kv_cache_list[i][0], 0),
-                    torch.cat(kv_cache_list[i][1], 0),
-                )
-            # print(f"returning kvcache size: {kv_cache_list[0][0].shape}")
+            # KV cache entries are now dicts (compressed or uncompressed),
+            # no need for concatenation since we store one entry per layer per batch item
 
         if output_attentions:
             all_self_attns = all_self_attns[0:-2]
