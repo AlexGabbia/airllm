@@ -21,6 +21,7 @@ if platform == "darwin":
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
+from safetensors import safe_open
 
 from .persist import ModelPersister
 
@@ -242,6 +243,16 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         layers = [l + "." for l in layers]
 
 
+    # Filter out layers that have no weights in the weight_map (e.g., lm_head when tie_word_embeddings=True)
+    # These layers will be handled at runtime without needing separate saved files.
+    layers_with_weights = []
+    for layer in layers:
+        has_weights = any(k.startswith(layer) for k in index.keys())
+        if has_weights:
+            layers_with_weights.append(layer)
+        else:
+            print(f"Note: layer '{layer}' has no weights in model file (likely tied embeddings), skipping split file.")
+
     # check if splitting exists and all files are there
     found_layers = None
     #print(f"checking exists: {saving_path}")
@@ -249,7 +260,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         # dir already exists, check if all layer files are there
 
         found_layers = {}
-        for layer in layers:
+        for layer in layers_with_weights:
             found_layers[layer] = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
 
         print(f"found_layers:{found_layers}")
@@ -263,91 +274,185 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     if not delete_original:
         check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
 
-
-    shard = 0
-    n_shards = len(set(index.values()))
-    state_dict = {}
-
-
     if not os.path.exists(saving_path):
-        #os.makedirs(saving_path)
         saving_path.mkdir(parents=True, exist_ok=True)
 
-    single_modelfile = None
+    # Memory-efficient splitting: read safetensors header to get tensor offsets,
+    # then read only the bytes needed for each layer directly from the file.
+    # This avoids loading entire shards into RAM.
 
-    for layer in tqdm(layers):
+    # Map safetensors dtype strings to numpy dtypes for robust reading.
+    # We use numpy as an intermediate because torch.frombuffer doesn't
+    # support all dtypes on all platforms (notably BF16).
+    import numpy as np
+    import struct
 
-        # Optionnally load next shard
-        # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
-        shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
-        if len(shards) > 0:
-            if max(shards) > shard:
-                # optinoally delete original file
-                if delete_original and shard != 0:
-                    if not safetensors_format:
-                        to_delete = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                    else:
-                        to_delete = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
+    NUMPY_DTYPE_MAP = {
+        'BOOL': np.bool_, 'U8': np.uint8, 'I8': np.int8,
+        'I16': np.int16, 'I32': np.int32, 'I64': np.int64,
+        'F16': np.float16, 'F32': np.float32, 'F64': np.float64,
+        'BF16': None,  # Special handling — no numpy dtype for BF16
+    }
+    TORCH_DTYPE_MAP = {
+        'BOOL': torch.bool, 'U8': torch.uint8, 'I8': torch.int8,
+        'I16': torch.int16, 'I32': torch.int32, 'I64': torch.int64,
+        'F16': torch.float16, 'F32': torch.float32, 'F64': torch.float64,
+        'BF16': torch.bfloat16,
+    }
 
-                    print(f"deleting original file: {to_delete}")
-                    remove_real_and_linked_file(to_delete)
-                shard += 1
-                print(f'Loading shard {shard}/{n_shards}')
+    def _read_safetensors_header(shard_path):
+        """Read safetensors file header to get tensor metadata and offsets."""
+        with open(shard_path, 'rb') as f:
+            header_len = struct.unpack('<Q', f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        data_offset = 8 + header_len
+        return header, data_offset
 
-                if not safetensors_format:
-                    to_load = checkpoint_path / f'pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin'
-                else:
-                    to_load = checkpoint_path / f'model-000{shard:02d}-of-000{n_shards:02d}.safetensors'
+    # Group parameter keys by shard file (only for layers that have weights)
+    layer_keys_by_shard = defaultdict(lambda: defaultdict(list))
+    for param_key, shard_file in index.items():
+        for layer in layers_with_weights:
+            if param_key.startswith(layer):
+                layer_keys_by_shard[shard_file][layer].append(param_key)
+                break
 
-                # check if to_load exist, if not downloaad it...
-                if not os.path.exists(to_load):
-                    assert repo_id is not None
-                    huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                    token=hf_token)
-
-                if not safetensors_format:
-                    state_dict.update(torch.load(to_load, map_location='cpu'))
-                else:
-                    state_dict.update(load_file(to_load, device='cpu'))
-
-        else:
-            shards = [v for k, v in index.items() if k.startswith(layer)]
-            single_modelfile = shards[0]
-            to_load = checkpoint_path / single_modelfile
-            # check if to_load exist, if not downloaad it...
-            if not os.path.exists(to_load):
-                assert repo_id is not None
-                huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                token=hf_token)
-            if not safetensors_format:
-                state_dict.update(torch.load(to_load, map_location='cpu'))
+    # Process each shard file
+    # We save each layer after each shard, and if a layer has weights
+    # in multiple shards, we load the existing file and merge the new tensors.
+    saved_layers = set()
+    for shard_file in sorted(set(index.values())):
+        shard_path = checkpoint_path / shard_file
+        if not os.path.exists(shard_path):
+            if repo_id is not None:
+                huggingface_hub.snapshot_download(repo_id, allow_patterns=shard_file, token=hf_token)
             else:
-                state_dict.update(load_file(to_load, device='cpu'))
+                raise FileNotFoundError(f"Shard file not found: {shard_path}")
 
-        # Get layer state dict
-        layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+        shard_size_gb = shard_path.stat().st_size / 1e9
+        print(f'Processing shard: {shard_file} ({shard_size_gb:.1f} GB)')
 
-        layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+        if safetensors_format:
+            # Read header once (tiny - a few KB)
+            header, data_offset = _read_safetensors_header(shard_path)
+            header_keys = set(k for k in header.keys() if k != '__metadata__')
 
-        # Save layer state dict as using safetensors
+            # Open the shard file once and keep it open for all tensor reads
+            with open(shard_path, 'rb') as shard_f:
+                for layer in tqdm(layers_with_weights, desc=f"  splitting {shard_file}", leave=False):
+                    layer_keys = layer_keys_by_shard.get(shard_file, {}).get(layer, [])
+                    if not layer_keys:
+                        continue
 
-        marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
-        if not marker_exists:
-            ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+                    # Read only the tensors for this layer from this shard
+                    layer_state_dict = {}
+                    for k in layer_keys:
+                        if k not in header_keys:
+                            continue
+                        info = header[k]
+                        start, end = info['data_offsets']
+                        dtype_str = info['dtype']
+                        shape = tuple(info['shape'])
+                        byte_size = end - start
 
-        # Free memory
-        for k in layer_state_dict.keys():
-            if k in state_dict:
-                del state_dict[k]
-        del layer_state_dict
-        clean_memory()
+                        # Seek to tensor data and read
+                        shard_f.seek(data_offset + start)
+                        raw = shard_f.read(byte_size)
 
-    # deleting single modelfile if only a single modelfile was existing in hf repo 
-    # and deletion of single modelfile should happen in the end if delete_original=True
-    if delete_original and single_modelfile != None:
-        to_delete = checkpoint_path / single_modelfile
-        print(f"deleting original file: {to_delete}")
-        remove_real_and_linked_file(to_delete)
+                        # Convert bytes to tensor
+                        torch_dtype = TORCH_DTYPE_MAP.get(dtype_str, torch.float32)
+                        np_dtype = NUMPY_DTYPE_MAP.get(dtype_str)
+
+                        if dtype_str == 'BF16':
+                            tensor = torch.frombuffer(raw, dtype=torch.bfloat16).reshape(shape).clone()
+                        elif np_dtype is not None:
+                            np_array = np.frombuffer(raw, dtype=np_dtype)
+                            tensor = torch.from_numpy(np_array).reshape(shape).clone()
+                        else:
+                            tensor = torch.frombuffer(raw, dtype=torch_dtype).reshape(shape).clone()
+
+                        layer_state_dict[k] = tensor
+
+                    if not layer_state_dict:
+                        continue
+
+                    # If this layer was already saved from a previous shard,
+                    # load existing and merge the new tensors.
+                    # Note: layer names in layers_with_weights have a trailing dot
+                    # (e.g. "model.language_model.layers.0.") but load_model expects
+                    # names WITHOUT trailing dots (it adds ".safetensors" itself).
+                    # persist_model uses layer_name + 'safetensors' (no extra dot),
+                    # so the file is saved as "model.language_model.layers.0.safetensors".
+                    if layer in saved_layers:
+                        load_name = layer.rstrip('.')
+                        existing = ModelPersister.get_model_persister().load_model(load_name, saving_path)
+                        # Clone tensors to detach from memory-mapped file (Windows fix:
+                        # OS error 1224 - can't write to a file with user-mapped section)
+                        existing = {k: v.clone() for k, v in existing.items()}
+                        existing.update(layer_state_dict)
+                        layer_state_dict = existing
+                        # Remove the existing file and .done marker before re-saving
+                        # to avoid Windows file locking issues
+                        existing_file = saving_path / (layer + 'safetensors')
+                        if os.path.exists(existing_file):
+                            os.remove(existing_file)
+                        done_marker = saving_path / (layer + 'safetensors.done')
+                        if os.path.exists(done_marker):
+                            os.remove(done_marker)
+
+                    layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+                    ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+                    saved_layers.add(layer)
+
+                    del layer_state_dict
+                    clean_memory()
+        else:
+            # Pytorch format fallback — merge across shards like safetensors
+            state_dict = torch.load(shard_path, map_location='cpu')
+            for layer in layers_with_weights:
+                layer_state_dict = {k: v for k, v in state_dict.items() if k.startswith(layer)}
+                if not layer_state_dict:
+                    continue
+
+                # If this layer was already saved from a previous shard, merge
+                # Strip trailing dot from layer name for load_model (see safetensors branch)
+                if layer in saved_layers:
+                    load_name = layer.rstrip('.')
+                    existing = ModelPersister.get_model_persister().load_model(load_name, saving_path)
+                    # Clone tensors to detach from memory-mapped file (Windows fix)
+                    existing = {k: v.clone() for k, v in existing.items()}
+                    existing.update(layer_state_dict)
+                    layer_state_dict = existing
+                    existing_file = saving_path / (layer + 'safetensors')
+                    if os.path.exists(existing_file):
+                        os.remove(existing_file)
+                    done_marker = saving_path / (layer + 'safetensors.done')
+                    if os.path.exists(done_marker):
+                        os.remove(done_marker)
+
+                layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+                ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+                saved_layers.add(layer)
+
+                for k in list(layer_state_dict.keys()):
+                    if k in state_dict:
+                        del state_dict[k]
+                del layer_state_dict
+                clean_memory()
+            del state_dict
+            clean_memory()
+
+    # Handle any layers that weren't found in shards
+    for layer in layers_with_weights:
+        if layer not in saved_layers:
+            print(f"Warning: layer {layer} was not found in any shard file")
+
+    # deleting original file if delete_original=True
+    if delete_original:
+        for shard_file in set(index.values()):
+            to_delete = checkpoint_path / shard_file
+            if os.path.exists(to_delete):
+                print(f"deleting original file: {to_delete}")
+                remove_real_and_linked_file(to_delete)
 
     return str(saving_path)
 

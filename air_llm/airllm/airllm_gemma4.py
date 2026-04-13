@@ -24,7 +24,15 @@ class AirLLMGemma4(AirLLMBaseModel):
     [sliding, sliding, sliding, sliding, sliding, full_attention] x 10
     Layers 5, 11, 17, 23, 29, 35, 41, 47, 53, 59 are full attention
     All others are sliding window (1024 tokens)
+
+    KV Cache: Gemma4 uses transformers Cache objects (DynamicCache with
+    sliding window layers) instead of returning (k, v) tuples from the
+    decoder layer. The decoder layer only returns hidden_states and
+    updates the Cache object in-place.
     """
+
+    # Gemma4 decoder layers use Cache objects, not tuple returns
+    uses_cache_object = True
 
     def set_layer_names_dict(self):
         """
@@ -58,17 +66,24 @@ class AirLLMGemma4(AirLLMBaseModel):
         """
         Run language model head for Gemma 4.
 
-        Gemma 4 multimodal model has language model nested under
-        model.language_model, so embed_tokens is at
-        model.language_model.embed_tokens (not model.model.embed_tokens).
+        Gemma4ForConditionalGeneration has structure:
+          model.language_model.embed_tokens
+        Accessing embed_tokens requires navigating through the nested structure.
         """
         if self.config.tie_word_embeddings:
-            # Gemma4ForConditionalGeneration nests the text model
-            # under model.language_model
+            # Navigate the nested model structure to find embed_tokens
+            # Try: model.language_model.embed_tokens (Gemma4ForConditionalGeneration)
+            # Then: model.model.language_model.embed_tokens (if model is wrapped)
+            # Then: model.model.embed_tokens (standard Llama-like structure)
+            embed_tokens = None
             if hasattr(self.model, 'language_model'):
                 embed_tokens = self.model.language_model.embed_tokens
-            else:
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'language_model'):
+                embed_tokens = self.model.model.language_model.embed_tokens
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
                 embed_tokens = self.model.model.embed_tokens
+            if embed_tokens is None:
+                raise AttributeError("Cannot find embed_tokens for tied lm_head")
             seq = seq @ embed_tokens.weight.T
         else:
             seq = layer(seq)
@@ -77,9 +92,22 @@ class AirLLMGemma4(AirLLMBaseModel):
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
         """
         Handle sliding window attention mask for Gemma 4.
-        Sliding window layers use a causal mask limited to 1024 tokens.
-        Full attention layers (every 6th) use the full causal mask.
+
+        During prefill (len_p=0): Q and K both have len_s tokens,
+        so mask shape is [batch, heads, len_s, len_s].
+
+        During generation (len_p>0): Q has len_s tokens (typically 1),
+        K has len_p+len_s tokens. Mask shape should be
+        [batch, heads, len_s, len_p+len_s].
         """
+        if len_p > 0:
+            # Generation: query length = len_s, key length = len_p + len_s
+            return {
+                "attention_mask": full_attention_mask[
+                    :, :, -len_s:, -len_p - len_s:
+                ]
+            }
+        # Prefill: full causal mask for all tokens
         return {
             "attention_mask": full_attention_mask[
                 :, :, -len_p - len_s :, -len_p - len_s :
@@ -89,15 +117,184 @@ class AirLLMGemma4(AirLLMBaseModel):
     def get_pos_emb_args(self, len_p, len_s):
         """
         Position embedding arguments for Gemma 4.
-        Gemma 4 uses RoPE with different configs for sliding vs full attention.
+        Returns position_embeddings (cos, sin) tuple for the current decoder layer.
+
+        During prefill (len_p=0), uses precomputed position_embeddings from
+        compute_position_embeddings(). During generation (len_p>0, len_s=1),
+        recomputes position_embeddings for the single new token position.
         """
+        if len_p > 0:
+            # Generation mode: recompute position_embeddings for the new token
+            decoder_idx = getattr(self, '_current_decoder_idx', -1)
+            if decoder_idx >= 0:
+                return self._compute_pos_emb_for_generation(len_p, len_s, decoder_idx)
+            return {}
+
+        # Prefill mode: use precomputed position_embeddings
+        if hasattr(self, '_position_embeddings_data') and self._position_embeddings_data is not None:
+            decoder_idx = getattr(self, '_current_decoder_idx', -1)
+            if decoder_idx >= 0:
+                return self.get_position_embeddings_for_layer(
+                    self._position_embeddings_data, decoder_idx
+                )
+        return {}
+
+    def _compute_pos_emb_for_generation(self, len_p, len_s, layer_idx):
+        """
+        Compute position_embeddings for a single generation step.
+        len_p = number of past tokens, len_s = 1 (new token).
+        Position ID for the new token is len_p.
+        """
+        text_model = self.model.model.language_model
+        rotary_emb = getattr(text_model, 'rotary_emb', None)
+        if rotary_emb is None:
+            return {}
+
+        text_config = getattr(self.config, 'text_config', None) or self.config
+        layer_types = getattr(text_config, 'layer_types', None)
+        if layer_types is None or layer_idx >= len(layer_types):
+            return {}
+
+        layer_type = layer_types[layer_idx]
+
+        # Create position_ids for the new token only
+        device = self.running_device
+        position_ids = torch.arange(len_p, len_p + len_s, dtype=torch.long, device=device)[None, :]
+
+        # We need hidden_states just for dtype/device; use a dummy
+        # rotary_emb only uses position_ids shape for the output shape
+        text_config = getattr(self.config, 'text_config', None) or self.config
+        hidden_size = getattr(text_config, 'hidden_size', 5376)
+        dummy_hidden = torch.zeros(1, len_s, hidden_size, device=device, dtype=self.running_dtype)
+        cos, sin = rotary_emb(dummy_hidden, position_ids, layer_type=layer_type)
+
+        return {"position_embeddings": (cos, sin)}
+
+    def compute_position_embeddings(self, hidden_states, position_ids):
+        """
+        Precompute position embeddings (cos, sin) for each layer type.
+
+        Gemma4 has different RoPE parameters for sliding_attention and
+        full_attention layers. The model's rotary_emb module computes
+        different cos/sin for each type.
+
+        Returns a dict: {layer_type: (cos, sin)}
+        """
+        text_model = self.model.model.language_model
+        rotary_emb = getattr(text_model, 'rotary_emb', None)
+        if rotary_emb is None:
+            return {}
+
+        # Get layer types from config
+        text_config = getattr(self.config, 'text_config', None) or self.config
+        layer_types = getattr(text_config, 'layer_types', None)
+        if layer_types is None:
+            return {}
+
+        # Compute position embeddings for each unique layer type
+        unique_types = set(layer_types)
+        position_embeddings = {}
+        for layer_type in unique_types:
+            cos, sin = rotary_emb(hidden_states, position_ids, layer_type=layer_type)
+            position_embeddings[layer_type] = (cos, sin)
+
+        return position_embeddings, layer_types
+
+    def get_position_embeddings_for_layer(self, position_embeddings_data, layer_idx):
+        """
+        Get the position_embeddings (cos, sin) for a specific decoder layer.
+        """
+        if position_embeddings_data is None:
+            return {}
+        pos_emb_dict, layer_types = position_embeddings_data
+        if layer_idx < len(layer_types):
+            layer_type = layer_types[layer_idx]
+            if layer_type in pos_emb_dict:
+                return {"position_embeddings": pos_emb_dict[layer_type]}
         return {}
 
     def get_past_key_value_args(self, k_cache, v_cache):
         """
         Past key value arguments for Gemma 4.
+        Creates a DynamicCache pre-populated with the given K/V cache.
         """
-        return {"past_key_value": (k_cache, v_cache)}
+        return {"past_key_values": self.create_layer_cache(0, k_cache, v_cache)}
+
+    def create_layer_cache(self, layer_idx, k_cache=None, v_cache=None):
+        """
+        Create a DynamicCache for a single decoder layer call.
+
+        Gemma4 uses DynamicCache with sliding window support.
+        We create a minimal cache with only the layer we need,
+        pre-populate it with existing K/V (if any), and return it.
+
+        Args:
+            layer_idx: The decoder layer index (0-59) that will be called
+            k_cache: Existing key cache tensor (batch, kv_heads, seq, head_dim) or None
+            v_cache: Existing value cache tensor (batch, kv_heads, seq, head_dim) or None
+
+        Returns:
+            DynamicCache ready to be passed to the decoder layer
+        """
+        from transformers import DynamicCache
+        from transformers.cache_utils import DynamicSlidingWindowLayer, DynamicLayer
+
+        # Create cache WITHOUT config to avoid allocating all 60 layers
+        cache = DynamicCache()
+
+        # Get layer types to determine if this layer uses sliding window
+        text_config = getattr(self.config, 'text_config', None) or self.config
+        layer_types = getattr(text_config, 'layer_types', None)
+        sliding_window = getattr(text_config, 'sliding_window', None)
+
+        # Create the appropriate cache layer type
+        if layer_types is not None and layer_idx < len(layer_types):
+            if layer_types[layer_idx] == 'sliding_attention' and sliding_window is not None:
+                cache_layer = DynamicSlidingWindowLayer(sliding_window=sliding_window)
+            else:
+                cache_layer = DynamicLayer()
+        else:
+            cache_layer = DynamicLayer()
+
+        # Pre-populate with existing K/V if provided
+        if k_cache is not None and v_cache is not None:
+            cache_layer.keys = k_cache.to(device=self.running_device, dtype=self.running_dtype)
+            cache_layer.values = v_cache.to(device=self.running_device, dtype=self.running_dtype)
+            # Mark as initialized so update() doesn't overwrite with empty tensors
+            cache_layer.is_initialized = True
+            cache_layer.dtype = self.running_dtype
+            cache_layer.device = self.running_device
+            # Update cumulative length for sliding window layers
+            if hasattr(cache_layer, 'cumulative_length'):
+                cache_layer.cumulative_length = k_cache.shape[2]
+
+        # Add the cache layer at the correct index
+        # Pad with None layers up to layer_idx so the index is correct
+        while len(cache.layers) < layer_idx:
+            cache.layers.append(None)
+        if len(cache.layers) == layer_idx:
+            cache.layers.append(cache_layer)
+        else:
+            cache.layers[layer_idx] = cache_layer
+
+        return cache
+
+    def extract_kv_from_cache(self, cache, layer_idx):
+        """
+        Extract K/V tensors from a DynamicCache after a decoder layer call.
+
+        Args:
+            cache: The DynamicCache that was passed to the decoder layer
+            layer_idx: The decoder layer index to extract from
+
+        Returns:
+            (k_cache, v_cache) tuple of tensors
+        """
+        if layer_idx < len(cache.layers):
+            cache_layer = cache.layers[layer_idx]
+            if cache_layer is not None and hasattr(cache_layer, 'keys'):
+                return cache_layer.keys.clone(), cache_layer.values.clone()
+        return None, None
 
     def _is_full_attention_layer(self, layer_idx):
         """

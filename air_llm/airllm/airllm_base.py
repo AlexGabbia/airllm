@@ -52,6 +52,12 @@ except ImportError:
 
 class AirLLMBaseModel(GenerationMixin):
     # customize layer names here
+
+    # No-op for HuggingFace GenerationMixin compatibility
+    # (called by _optimize_model_for_decode during generation)
+    def set_experts_implementation(self, implementation):
+        pass
+
     def set_layer_names_dict(self):
         self.layer_names_dict = {
             "embed": "model.embed_tokens",
@@ -183,8 +189,6 @@ class AirLLMBaseModel(GenerationMixin):
         if 'vision_layer_prefix' in self.layer_names_dict:
             vision_attr = self.model
             for attr_name in self.layer_names_dict["vision_layer_prefix"].split("."):
-                if attr_name == 'model':
-                    continue
                 vision_attr = getattr(vision_attr, attr_name, None)
                 if vision_attr is None:
                     break
@@ -232,9 +236,21 @@ class AirLLMBaseModel(GenerationMixin):
         if kv_compression is not None:
             from .rotorquant_cache import RotorQuantKVCache
 
+            # For multimodal models (e.g. Gemma4), text-level attributes
+            # may be in config.text_config rather than config directly
+            text_config = getattr(self.config, "text_config", None)
+
             head_dim = getattr(self.config, "head_dim", None)
+            if head_dim is None and text_config is not None:
+                head_dim = getattr(text_config, "head_dim", None)
             if head_dim is None:
-                head_dim = self.config.hidden_size // self.config.num_attention_heads
+                config_for_dims = text_config if text_config is not None else self.config
+                hidden_size = getattr(config_for_dims, "hidden_size", None)
+                num_attention_heads = getattr(config_for_dims, "num_attention_heads", None)
+                if hidden_size is not None and num_attention_heads is not None:
+                    head_dim = hidden_size // num_attention_heads
+                else:
+                    head_dim = 256  # fallback
 
             self.kv_compressor = RotorQuantKVCache(
                 mode=kv_compression,
@@ -245,7 +261,10 @@ class AirLLMBaseModel(GenerationMixin):
 
             # Handle models with mixed head dimensions (e.g., Gemma 4 global attention)
             self.kv_compressor_global = None
+            # global_head_dim may be in text_config for multimodal models
             global_head_dim = getattr(self.config, "global_head_dim", None)
+            if global_head_dim is None and text_config is not None:
+                global_head_dim = getattr(text_config, "global_head_dim", None)
             if global_head_dim is not None and global_head_dim != head_dim:
                 self.kv_compressor_global = RotorQuantKVCache(
                     mode=kv_compression,
@@ -402,6 +421,32 @@ class AirLLMBaseModel(GenerationMixin):
     def set_layers_from_layer_names(self):
         self.layers = []
 
+        # Add vision tower modules first (if present)
+        if 'vision_patch_embedder' in self.layer_names_dict:
+            model_attr = self.model
+            for attr_name in self.layer_names_dict["vision_patch_embedder"].split("."):
+                model_attr = getattr(model_attr, attr_name)
+            self.layers.append(model_attr)
+
+        if 'vision_layer_prefix' in self.layer_names_dict:
+            model_attr = self.model
+            for attr_name in self.layer_names_dict["vision_layer_prefix"].split("."):
+                model_attr = getattr(model_attr, attr_name)
+            self.layers.extend(list(model_attr))
+
+        if 'vision_std' in self.layer_names_dict:
+            model_attr = self.model
+            for attr_name in self.layer_names_dict["vision_std"].split("."):
+                model_attr = getattr(model_attr, attr_name)
+            self.layers.append(model_attr)
+
+        if 'embed_vision' in self.layer_names_dict:
+            model_attr = self.model
+            for attr_name in self.layer_names_dict["embed_vision"].split("."):
+                model_attr = getattr(model_attr, attr_name)
+            self.layers.append(model_attr)
+
+        # Language model modules
         model_attr = self.model
         for attr_name in self.layer_names_dict["embed"].split("."):
             model_attr = getattr(model_attr, attr_name)
@@ -515,18 +560,27 @@ class AirLLMBaseModel(GenerationMixin):
         **kwargs,
     ):
         if past_key_values is not None:
-            past_length = self.get_past_key_values_cache_seq_len(
-                past_key_values
-            )  # [0][0].shape[2]
-
-            # Some generation methods already pass only the last input ID
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
+            # Treat empty cache objects as None (transformers 5.x passes empty DynamicCache)
+            # DynamicCache has get_seq_length() method; our custom format is a list
+            is_empty_cache = False
+            if hasattr(past_key_values, 'get_seq_length'):
+                # DynamicCache or similar cache object from transformers
+                is_empty_cache = past_key_values.get_seq_length() == 0
+            if is_empty_cache:
+                past_key_values = None
             else:
-                # Default to old behavior: keep only final ID
-                remove_prefix_length = input_ids.shape[1] - 1
+                past_length = self.get_past_key_values_cache_seq_len(
+                    past_key_values
+                )  # [0][0].shape[2]
 
-            input_ids = input_ids[:, remove_prefix_length:]
+                # Some generation methods already pass only the last input ID
+                if input_ids.shape[1] > past_length:
+                    remove_prefix_length = past_length
+                else:
+                    # Default to old behavior: keep only final ID
+                    remove_prefix_length = input_ids.shape[1] - 1
+
+                input_ids = input_ids[:, remove_prefix_length:]
 
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
@@ -572,6 +626,14 @@ class AirLLMBaseModel(GenerationMixin):
         return self.forward(*args, **kwargs)
 
     def get_past_key_values_cache_seq_len(self, past_key_values):
+        # Handle DynamicCache from transformers >= 4.36
+        if hasattr(past_key_values, '_seen_tokens'):
+            return past_key_values._seen_tokens
+        # Handle Cache objects with key_cache attribute
+        if hasattr(past_key_values, 'key_cache'):
+            if len(past_key_values.key_cache) > 0:
+                return past_key_values.key_cache[0].shape[2]
+            return 0
         entry = past_key_values[0]
         if isinstance(entry, dict):
             # Compressed or uncompressed dict format
@@ -590,6 +652,22 @@ class AirLLMBaseModel(GenerationMixin):
 
     def get_past_key_value_args(self, k_cache, v_cache):
         return {"past_key_value": (k_cache, v_cache)}
+
+    def create_layer_cache(self, layer_idx, k_cache=None, v_cache=None):
+        """
+        Create a Cache object for models that use Cache-based KV management
+        (e.g., Gemma4). Default implementation returns None; subclasses
+        that use Cache objects should override this.
+        """
+        return None
+
+    def extract_kv_from_cache(self, cache, layer_idx):
+        """
+        Extract K/V tensors from a Cache object after a decoder layer call.
+        Default implementation returns None; subclasses that use Cache
+        objects should override this.
+        """
+        return None, None
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
         return {"attention_mask": full_attention_mask[:, :, -len_s:, -len_p - len_s :]}
@@ -688,55 +766,82 @@ class AirLLMBaseModel(GenerationMixin):
         all_hidden_states = [] * len(self.layers) if output_hidden_states else None
         all_self_attns = [] * len(self.layers) if output_attentions else None
 
+        # Gemma4 uses shared_kv_states dict for KV sharing between
+        # sliding window and full attention layers. Initialized empty,
+        # layers populate it during forward pass.
+        shared_kv_states = {}
+
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
+            # Find the first layer that actually needs loading (skip tied lm_head etc.)
+            first_load_idx = 0
+            while first_load_idx < len(self.layer_names):
+                first_skip = (
+                    self.layer_names[first_load_idx] == self.layer_names_dict["lm_head"]
+                    and getattr(self.config, "tie_word_embeddings", False)
+                )
+                if not first_skip:
+                    break
+                first_load_idx += 1
+
             # Load first layer
-            if self.prefetching:
-                # with torch.cuda.stream(self.stream):
-                # state_dict = self.load_layer_to_cpu(self.layer_names[0])
-                future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
+            if self.prefetching and first_load_idx < len(self.layer_names):
+                future = executor.submit(self.load_layer_to_cpu, self.layer_names[first_load_idx])
 
             for i, (layer_name, layer) in tqdm(
                 enumerate(zip(self.layer_names, self.layers)),
                 desc=f"running layers({self.running_device})",
                 total=len(self.layers),
             ):
+                # Skip loading weights for lm_head when tie_word_embeddings=True
+                # (run_lm_head uses embed_tokens.weight.T directly)
+                skip_loading = (
+                    layer_name == self.layer_names_dict["lm_head"]
+                    and getattr(self.config, "tie_word_embeddings", False)
+                )
+
                 if self.prefetching:
-                    if self.profiling_mode:
-                        t = time.time()
-                    # Load current layer and prepare next layer
-                    state_dict = future.result()
-                    # torch.cuda.current_stream().wait_stream(self.stream)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time(
-                            "load_safe_tensor_cpu_wait", elapsed_time
+                    if skip_loading:
+                        state_dict = {}
+                        moved_layers = []
+                    else:
+                        if self.profiling_mode:
+                            t = time.time()
+                        # Load current layer and prepare next layer
+                        state_dict = future.result()
+                        # torch.cuda.current_stream().wait_stream(self.stream)
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time(
+                                "load_safe_tensor_cpu_wait", elapsed_time
+                            )
+
+                        if self.profiling_mode:
+                            t = time.time()
+                        moved_layers = self.move_layer_to_device(state_dict)
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time(
+                                "create_layer_from_state_dict", elapsed_time
+                            )
+
+                    # kick off next layer loading (skip layers that don't need loading)
+                    next_loading_idx = i + 1
+                    while next_loading_idx < len(self.layer_names):
+                        next_name = self.layer_names[next_loading_idx]
+                        next_skip = (
+                            next_name == self.layer_names_dict["lm_head"]
+                            and getattr(self.config, "tie_word_embeddings", False)
                         )
+                        if not next_skip:
+                            break
+                        next_loading_idx += 1
 
-                    # for param_name, param in state_dict.items():
-                    #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time(
-                            "create_layer_from_state_dict", elapsed_time
-                        )
-
-                    # kick off next layer loading
-
-                    if (i + 1) < len(self.layer_names):
-                        # with torch.cuda.stream(self.stream):
-                        # state_dict = self.load_layer_to_cpu(self.layer_names[i + 1])
+                    if next_loading_idx < len(self.layer_names):
                         if self.profiling_mode:
                             t = time.time()
                         future = executor.submit(
-                            self.load_layer_to_cpu, self.layer_names[i + 1]
+                            self.load_layer_to_cpu, self.layer_names[next_loading_idx]
                         )
-                        # for param_name, param in state_dict.items():
-                        #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
                         if self.profiling_mode:
                             elapsed_time = time.time() - t
                             self.profiler.add_profiling_time(
@@ -744,15 +849,19 @@ class AirLLMBaseModel(GenerationMixin):
                             )
 
                 else:
-                    state_dict = self.load_layer_to_cpu(layer_name)
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time(
-                            "create_layer_from_safe_tensor", elapsed_time
-                        )
+                    if skip_loading:
+                        state_dict = {}
+                        moved_layers = []
+                    else:
+                        state_dict = self.load_layer_to_cpu(layer_name)
+                        if self.profiling_mode:
+                            t = time.time()
+                        moved_layers = self.move_layer_to_device(state_dict)
+                        if self.profiling_mode:
+                            elapsed_time = time.time() - t
+                            self.profiler.add_profiling_time(
+                                "create_layer_from_safe_tensor", elapsed_time
+                            )
 
                 # Run layer
 
@@ -766,6 +875,14 @@ class AirLLMBaseModel(GenerationMixin):
                         continue
                     elif layer_name == self.layer_names_dict["embed"]:
                         batch[j] = layer(seq)
+                        # Compute position embeddings for Gemma4-style models
+                        # that require (cos, sin) per layer type
+                        # Use actual sequence length, not max_seq_len
+                        if hasattr(self, 'compute_position_embeddings'):
+                            actual_seq_len = batch[j].shape[1]
+                            self._position_embeddings_data = self.compute_position_embeddings(
+                                batch[j], position_ids[:, :actual_seq_len]
+                            )
                         # Merge image embeddings after text embedding if vision is available
                         if self.has_vision and pixel_values is not None and past_key_values is None:
                             if hasattr(self, 'forward_vision'):
@@ -791,9 +908,14 @@ class AirLLMBaseModel(GenerationMixin):
                     else:
                         # This is a decoder (transformer) layer
                         decoder_idx = self._layer_idx_to_decoder_idx(i)
+                        # Store current decoder index for position embedding lookup
+                        self._current_decoder_idx = decoder_idx
 
                         if output_attentions:
                             all_hidden_states[i].append(new_seq)
+
+                        # Check if this model uses Cache objects (e.g., Gemma4)
+                        uses_cache_obj = getattr(self, 'uses_cache_object', False)
 
                         if past_key_values is not None:
                             # join past kv
@@ -816,12 +938,21 @@ class AirLLMBaseModel(GenerationMixin):
                             attention_mask_args = self.get_attention_mask_args(
                                 attention_mask, len_p, len_s
                             )
-                            past_key_value_args = self.get_past_key_value_args(
-                                k_cache, v_cache
-                            )
+
+                            if uses_cache_obj:
+                                # Create a Cache object pre-populated with K/V
+                                layer_cache = self.create_layer_cache(
+                                    decoder_idx, k_cache, v_cache
+                                )
+                                past_key_value_args = {"past_key_values": layer_cache}
+                            else:
+                                past_key_value_args = self.get_past_key_value_args(
+                                    k_cache, v_cache
+                                )
 
                             kwargs = {
                                 "use_cache": True,
+                                "shared_kv_states": shared_kv_states,
                             }
 
                             pos_embed_args = self.get_pos_emb_args(len_p, len_s)
@@ -833,30 +964,55 @@ class AirLLMBaseModel(GenerationMixin):
                                 **position_ids_args,
                             }
 
-                            layer_outputs = layer(seq, **kwargs)
-                            new_seq = layer_outputs[0]
+                            if uses_cache_obj:
+                                # Cache-object models: layer returns only hidden_states
+                                new_seq = layer(seq, **kwargs)
 
-                            if output_attentions:
-                                all_self_attns[i].append(layer_outputs[1])
-
-                            if use_cache:
-                                (k_cache, v_cache) = layer_outputs[
-                                    2 if output_attentions else 1
-                                ]
-                                if (
-                                    self.kv_compressor is not None
-                                    and not self._is_boundary_layer(decoder_idx)
-                                ):
-                                    compressor = self.get_kv_compressor(decoder_idx)
-                                    kv_cache_list[i] = compressor.compress(
-                                        k_cache, v_cache
+                                if use_cache:
+                                    k_cache, v_cache = self.extract_kv_from_cache(
+                                        layer_cache, decoder_idx
                                     )
-                                else:
-                                    kv_cache_list[i] = {
-                                        "k": k_cache,
-                                        "v": v_cache,
-                                        "is_compressed": False,
-                                    }
+                                    if k_cache is not None:
+                                        if (
+                                            self.kv_compressor is not None
+                                            and not self._is_boundary_layer(decoder_idx)
+                                        ):
+                                            compressor = self.get_kv_compressor(decoder_idx)
+                                            kv_cache_list[i] = compressor.compress(
+                                                k_cache, v_cache
+                                            )
+                                        else:
+                                            kv_cache_list[i] = {
+                                                "k": k_cache,
+                                                "v": v_cache,
+                                                "is_compressed": False,
+                                            }
+                            else:
+                                # Traditional models: layer returns (hidden_states, attn, (k, v))
+                                layer_outputs = layer(seq, **kwargs)
+                                new_seq = layer_outputs[0]
+
+                                if output_attentions:
+                                    all_self_attns[i].append(layer_outputs[1])
+
+                                if use_cache:
+                                    (k_cache, v_cache) = layer_outputs[
+                                        2 if output_attentions else 1
+                                    ]
+                                    if (
+                                        self.kv_compressor is not None
+                                        and not self._is_boundary_layer(decoder_idx)
+                                    ):
+                                        compressor = self.get_kv_compressor(decoder_idx)
+                                        kv_cache_list[i] = compressor.compress(
+                                            k_cache, v_cache
+                                        )
+                                    else:
+                                        kv_cache_list[i] = {
+                                            "k": k_cache,
+                                            "v": v_cache,
+                                            "is_compressed": False,
+                                        }
 
                         else:
                             len_seq = self.get_sequence_len(seq)
@@ -872,6 +1028,7 @@ class AirLLMBaseModel(GenerationMixin):
                             if not use_cache:
                                 kwargs = {
                                     "use_cache": False,
+                                    "shared_kv_states": shared_kv_states,
                                     "attention_mask": attention_mask[
                                         :, :, -len_seq:, -len_seq:
                                     ],
@@ -883,39 +1040,89 @@ class AirLLMBaseModel(GenerationMixin):
                                     **position_ids_args,
                                 }
 
-                                new_seq = layer(seq, **kwargs)[0]
-                            else:
-                                kwargs = {
-                                    "use_cache": True,
-                                    "attention_mask": attention_mask[
-                                        :, :, -len_seq:, -len_seq:
-                                    ],
-                                }
-                                kwargs = {
-                                    **kwargs,
-                                    **pos_embed_args,
-                                    **attention_mask_args,
-                                    **position_ids_args,
-                                }
-
-                                layer_out = layer(seq, **kwargs)
-
-                                # TODO: adopt Cache mechanism in 4.36
-                                new_seq, (k_cache, v_cache) = layer_out
-                                if (
-                                    self.kv_compressor is not None
-                                    and not self._is_boundary_layer(decoder_idx)
-                                ):
-                                    compressor = self.get_kv_compressor(decoder_idx)
-                                    kv_cache_list[i] = compressor.compress(
-                                        k_cache, v_cache
-                                    )
+                                if uses_cache_obj:
+                                    new_seq = layer(seq, **kwargs)
                                 else:
-                                    kv_cache_list[i] = {
-                                        "k": k_cache,
-                                        "v": v_cache,
-                                        "is_compressed": False,
+                                    new_seq = layer(seq, **kwargs)[0]
+                            else:
+                                if uses_cache_obj:
+                                    # Create empty cache for prefill
+                                    layer_cache = self.create_layer_cache(decoder_idx)
+                                    kwargs = {
+                                        "use_cache": True,
+                                        "past_key_values": layer_cache,
+                                        "shared_kv_states": shared_kv_states,
+                                        "attention_mask": attention_mask[
+                                            :, :, -len_seq:, -len_seq:
+                                        ],
                                     }
+                                    kwargs = {
+                                        **kwargs,
+                                        **pos_embed_args,
+                                        **attention_mask_args,
+                                        **position_ids_args,
+                                    }
+
+                                    try:
+                                        new_seq = layer(seq, **kwargs)
+                                    except RuntimeError as e:
+                                        if 'meta' in str(e).lower() or 'device' in str(e).lower():
+                                            print(f"  FAILED layer_name={layer_name}, decoder_idx={decoder_idx}")
+                                            meta_params = [pn for pn, pp in layer.named_parameters() if pp.device.type == 'meta']
+                                            if meta_params:
+                                                print(f"  Meta params: {meta_params[:5]}...")
+                                        raise
+
+                                    # Extract K/V from cache
+                                    k_cache, v_cache = self.extract_kv_from_cache(
+                                        layer_cache, decoder_idx
+                                    )
+                                    if k_cache is not None:
+                                        if (
+                                            self.kv_compressor is not None
+                                            and not self._is_boundary_layer(decoder_idx)
+                                        ):
+                                            compressor = self.get_kv_compressor(decoder_idx)
+                                            kv_cache_list[i] = compressor.compress(
+                                                k_cache, v_cache
+                                            )
+                                        else:
+                                            kv_cache_list[i] = {
+                                                "k": k_cache,
+                                                "v": v_cache,
+                                                "is_compressed": False,
+                                            }
+                                else:
+                                    kwargs = {
+                                        "use_cache": True,
+                                        "attention_mask": attention_mask[
+                                            :, :, -len_seq:, -len_seq:
+                                        ],
+                                    }
+                                    kwargs = {
+                                        **kwargs,
+                                        **pos_embed_args,
+                                        **attention_mask_args,
+                                        **position_ids_args,
+                                    }
+
+                                    layer_out = layer(seq, **kwargs)
+
+                                    new_seq, (k_cache, v_cache) = layer_out
+                                    if (
+                                        self.kv_compressor is not None
+                                        and not self._is_boundary_layer(decoder_idx)
+                                    ):
+                                        compressor = self.get_kv_compressor(decoder_idx)
+                                        kv_cache_list[i] = compressor.compress(
+                                            k_cache, v_cache
+                                        )
+                                    else:
+                                        kv_cache_list[i] = {
+                                            "k": k_cache,
+                                            "v": v_cache,
+                                            "is_compressed": False,
+                                        }
 
                         batch[j] = new_seq
 
