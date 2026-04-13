@@ -22,7 +22,13 @@ from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
 from .profiler import LayeredProfiler
 
-from optimum.bettertransformer import BetterTransformer
+try:
+    from optimum.bettertransformer import BetterTransformer
+
+    bettertransformer_installed = True
+except ImportError:
+    BetterTransformer = None
+    bettertransformer_installed = False
 
 from .utils import clean_memory, load_layer, find_or_create_local_splitted_path
 
@@ -248,7 +254,7 @@ class AirLLMBaseModel(GenerationMixin):
             )
 
     def get_use_better_transformer(self):
-        return True
+        return bettertransformer_installed
 
     def _is_boundary_layer(self, layer_idx):
         """Check if layer is a boundary layer (should not be compressed)."""

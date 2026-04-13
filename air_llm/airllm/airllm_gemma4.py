@@ -22,11 +22,15 @@ class AirLLMGemma4(AirLLMBaseModel):
         """
         Layer names dictionary for Gemma 4.
         Maps logical components to their names in the model.
+
+        Gemma 4 is a multimodal model (Gemma4ForConditionalGeneration) where
+        the language model weights are nested under model.language_model.*
+        instead of directly under model.*.
         """
         self.layer_names_dict = {
-            "embed": "model.embed_tokens",
-            "layer_prefix": "model.layers",
-            "norm": "model.norm",
+            "embed": "model.language_model.embed_tokens",
+            "layer_prefix": "model.language_model.layers",
+            "norm": "model.language_model.norm",
             "lm_head": "lm_head",
         }
 
@@ -40,9 +44,18 @@ class AirLLMGemma4(AirLLMBaseModel):
     def run_lm_head(self, layer, seq):
         """
         Run language model head for Gemma 4.
+
+        Gemma 4 multimodal model has language model nested under
+        model.language_model, so embed_tokens is at
+        model.language_model.embed_tokens (not model.model.embed_tokens).
         """
         if self.config.tie_word_embeddings:
-            embed_tokens = self.model.model.embed_tokens
+            # Gemma4ForConditionalGeneration nests the text model
+            # under model.language_model
+            if hasattr(self.model, 'language_model'):
+                embed_tokens = self.model.language_model.embed_tokens
+            else:
+                embed_tokens = self.model.model.embed_tokens
             seq = seq @ embed_tokens.weight.T
         else:
             seq = layer(seq)
