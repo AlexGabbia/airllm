@@ -157,6 +157,7 @@ class AirLLMBaseModel(GenerationMixin):
         # print(f"using generation_config: {self.generation_config}")
 
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
+        self.processor = self.get_processor(hf_token=hf_token)
 
         self.init_model()
 
@@ -175,6 +176,37 @@ class AirLLMBaseModel(GenerationMixin):
             ]
             + [self.layer_names_dict["norm"], self.layer_names_dict["lm_head"]]
         )
+
+        # Add vision tower layers if present
+        self.n_vision_layers = 0
+        self.has_vision = False
+        if 'vision_layer_prefix' in self.layer_names_dict:
+            vision_attr = self.model
+            for attr_name in self.layer_names_dict["vision_layer_prefix"].split("."):
+                if attr_name == 'model':
+                    continue
+                vision_attr = getattr(vision_attr, attr_name, None)
+                if vision_attr is None:
+                    break
+            if vision_attr is not None:
+                self.n_vision_layers = len(vision_attr)
+                self.has_vision = self.n_vision_layers > 0
+
+        if self.has_vision:
+            vision_layer_names = (
+                [self.layer_names_dict['vision_patch_embedder']]
+                + [f"{self.layer_names_dict['vision_layer_prefix']}.{i}" for i in range(self.n_vision_layers)]
+                + [self.layer_names_dict['vision_std'], self.layer_names_dict['embed_vision']]
+            )
+            self.layer_names = vision_layer_names + self.layer_names
+            print(f"Vision tower enabled: {self.n_vision_layers} vision layers detected")
+
+        # Track how many non-decoder layers are before and after the decoder layers
+        # This is used for KV cache list indexing
+        # layer_names layout: [vision_prefixes...] + [embed, layer.0..layer.N-1, norm, lm_head]
+        self._embed_idx = self.layer_names.index(self.layer_names_dict["embed"])
+        self._norm_idx = self.layer_names.index(self.layer_names_dict["norm"])
+        self._lm_head_idx = self.layer_names.index(self.layer_names_dict["lm_head"])
 
         self.max_seq_len = max_seq_len
 
@@ -252,6 +284,25 @@ class AirLLMBaseModel(GenerationMixin):
             return AutoTokenizer.from_pretrained(
                 self.model_local_path, trust_remote_code=True
             )
+
+    def get_processor(self, hf_token=None):
+        """Load the multimodal processor (tokenizer + image processor) if available."""
+        try:
+            from transformers import AutoProcessor
+            if hf_token is not None:
+                processor = AutoProcessor.from_pretrained(
+                    self.model_local_path, token=hf_token, trust_remote_code=True
+                )
+            else:
+                processor = AutoProcessor.from_pretrained(
+                    self.model_local_path, trust_remote_code=True
+                )
+            # Verify it actually has image processing capabilities
+            if hasattr(processor, 'image_processor') and processor.image_processor is not None:
+                return processor
+            return None
+        except (ImportError, Exception):
+            return None
 
     def get_use_better_transformer(self):
         return bettertransformer_installed
@@ -499,6 +550,22 @@ class AirLLMBaseModel(GenerationMixin):
                 "attention_mask": attention_mask,
             }
         )
+
+        # Pass vision inputs only during prefill (first generation step)
+        if past_key_values is None:
+            pixel_values = kwargs.get("pixel_values", None)
+            pixel_position_ids = kwargs.get("pixel_position_ids", None)
+            padding_mask = kwargs.get("padding_mask", None)
+            num_soft_tokens = kwargs.get("num_soft_tokens", None)
+            if pixel_values is not None:
+                model_inputs["pixel_values"] = pixel_values
+            if pixel_position_ids is not None:
+                model_inputs["pixel_position_ids"] = pixel_position_ids
+            if padding_mask is not None:
+                model_inputs["padding_mask"] = padding_mask
+            if num_soft_tokens is not None:
+                model_inputs["num_soft_tokens"] = num_soft_tokens
+
         return model_inputs
 
     def __call__(self, *args, **kwargs):
@@ -536,6 +603,40 @@ class AirLLMBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def _is_vision_layer(self, layer_name):
+        """Check if a layer name belongs to the vision tower."""
+        if not self.has_vision:
+            return False
+        vision_prefixes = [
+            self.layer_names_dict.get('vision_patch_embedder', ''),
+            self.layer_names_dict.get('vision_layer_prefix', ''),
+            self.layer_names_dict.get('vision_std', ''),
+            self.layer_names_dict.get('embed_vision', ''),
+        ]
+        for prefix in vision_prefixes:
+            if prefix and layer_name.startswith(prefix):
+                return True
+        return False
+
+    def _is_decoder_layer(self, layer_name):
+        """Check if a layer name is a decoder (transformer) layer."""
+        return layer_name.startswith(self.layer_names_dict['layer_prefix'])
+
+    def _layer_idx_to_decoder_idx(self, layer_loop_idx):
+        """Map a loop index to a decoder layer index (0-based, only decoder layers).
+
+        Decoder layers are indexed starting from 0 (first transformer layer).
+        This maps from the position in self.layer_names to the decoder layer number.
+        """
+        return layer_loop_idx - self._embed_idx - 1
+
+    def merge_image_embeddings(self, inputs_embeds, image_features, input_ids):
+        """
+        Merge image features into text embeddings by replacing image token positions.
+        Override in subclasses for model-specific behavior.
+        """
+        return inputs_embeds
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -548,6 +649,10 @@ class AirLLMBaseModel(GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_position_ids: Optional[torch.LongTensor] = None,
+        padding_mask: Optional[torch.BoolTensor] = None,
+        num_soft_tokens: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if cache_utils_installed and self.kv_compressor is None:
             # Only disable use_cache if we don't have KV compression.
@@ -652,8 +757,29 @@ class AirLLMBaseModel(GenerationMixin):
                 # Run layer
 
                 for j, seq in enumerate(batch):
-                    if layer_name == self.layer_names_dict["embed"]:
+                    # Vision tower layers (only process during prefill when pixel_values provided)
+                    if self.has_vision and self._is_vision_layer(layer_name):
+                        if pixel_values is not None and past_key_values is None:
+                            # Vision layers are processed by forward_vision() in bulk,
+                            # not individually here. Skip them in the main loop.
+                            pass
+                        continue
+                    elif layer_name == self.layer_names_dict["embed"]:
                         batch[j] = layer(seq)
+                        # Merge image embeddings after text embedding if vision is available
+                        if self.has_vision and pixel_values is not None and past_key_values is None:
+                            if hasattr(self, 'forward_vision'):
+                                image_features = self.forward_vision(
+                                    pixel_values, pixel_position_ids,
+                                    padding_mask, num_soft_tokens
+                                )
+                                if image_features is not None:
+                                    batch[j] = self.merge_image_embeddings(
+                                        batch[j], image_features, seq
+                                    )
+                                    # Switch to inputs_embeds mode for subsequent layers
+                                    # since we now have merged embeddings
+                                    self._using_inputs_embeds = True
                     elif layer_name == self.layer_names_dict["norm"]:
                         # batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
@@ -663,14 +789,17 @@ class AirLLMBaseModel(GenerationMixin):
                     elif layer_name == self.layer_names_dict["lm_head"]:
                         batch[j] = self.run_lm_head(layer, seq)
                     else:
+                        # This is a decoder (transformer) layer
+                        decoder_idx = self._layer_idx_to_decoder_idx(i)
+
                         if output_attentions:
                             all_hidden_states[i].append(new_seq)
 
                         if past_key_values is not None:
                             # join past kv
-                            entry = past_key_values[i - 1]
+                            entry = past_key_values[decoder_idx]
                             if isinstance(entry, dict) and entry.get("is_compressed", False):
-                                compressor = self.get_kv_compressor(i - 1)
+                                compressor = self.get_kv_compressor(decoder_idx)
                                 k_cache, v_cache = compressor.decompress(entry)
                             elif isinstance(entry, dict):
                                 k_cache, v_cache = entry["k"], entry["v"]
@@ -716,9 +845,9 @@ class AirLLMBaseModel(GenerationMixin):
                                 ]
                                 if (
                                     self.kv_compressor is not None
-                                    and not self._is_boundary_layer(i - 1)
+                                    and not self._is_boundary_layer(decoder_idx)
                                 ):
-                                    compressor = self.get_kv_compressor(i - 1)
+                                    compressor = self.get_kv_compressor(decoder_idx)
                                     kv_cache_list[i] = compressor.compress(
                                         k_cache, v_cache
                                     )
@@ -775,9 +904,9 @@ class AirLLMBaseModel(GenerationMixin):
                                 new_seq, (k_cache, v_cache) = layer_out
                                 if (
                                     self.kv_compressor is not None
-                                    and not self._is_boundary_layer(i - 1)
+                                    and not self._is_boundary_layer(decoder_idx)
                                 ):
-                                    compressor = self.get_kv_compressor(i - 1)
+                                    compressor = self.get_kv_compressor(decoder_idx)
                                     kv_cache_list[i] = compressor.compress(
                                         k_cache, v_cache
                                     )
@@ -808,8 +937,14 @@ class AirLLMBaseModel(GenerationMixin):
 
         logits = torch.cat(batch, 0)
         if use_cache:
-            # Remove embed, norm, and lm_head entries
-            kv_cache_list = kv_cache_list[1:-2]
+            # Remove non-decoder entries (vision layers, embed, norm, lm_head)
+            # from the KV cache list. Only decoder transformer layers have KV cache.
+            # _embed_idx is the index of embed layer, _norm_idx and _lm_head_idx
+            # are the indices of norm and lm_head layers.
+            # Decoder layers are between embed and norm (exclusive).
+            decoder_start = self._embed_idx + 1  # first decoder layer
+            decoder_end = self._norm_idx  # one past last decoder layer
+            kv_cache_list = kv_cache_list[decoder_start:decoder_end]
             # KV cache entries are now dicts (compressed or uncompressed),
             # no need for concatenation since we store one entry per layer per batch item
 

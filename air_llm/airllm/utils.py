@@ -219,6 +219,11 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     else:
         n_layers = len(set([int(k[len(layer_names['layer_prefix']):].split('.')[1]) for k in index.keys() if layer_names['layer_prefix'] in k]))
 
+    # Count vision encoder layers if vision layer prefix is provided
+    n_vision_layers = 0
+    if layer_names is not None and 'vision_layer_prefix' in layer_names:
+        n_vision_layers = len(set([int(k[len(layer_names['vision_layer_prefix']):].split('.')[1]) for k in index.keys() if layer_names['vision_layer_prefix'] in k]))
+
     if layer_names is None:
         layers = ['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)] + ['model.norm.', 'lm_head.']
     else:
@@ -226,6 +231,14 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
         if 'rotary_pos_emb' in layer_names:
             layers = [layer_names['rotary_pos_emb']] + layers
+
+        # Add vision tower layers if present
+        if n_vision_layers > 0 and 'vision_layer_prefix' in layer_names:
+            vision_layers = [layer_names['vision_patch_embedder']] + \
+                            [f'{layer_names["vision_layer_prefix"]}.{i}' for i in range(n_vision_layers)] + \
+                            [layer_names['vision_std'], layer_names['embed_vision']]
+            layers = vision_layers + layers
+
         layers = [l + "." for l in layers]
 
 
